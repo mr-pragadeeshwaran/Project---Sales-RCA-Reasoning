@@ -1163,9 +1163,13 @@ def main():
     out = make_output_dir()
     print(f"\n[OUTPUT] Folder: {out}\n")
 
-    df1, df24, df_all = load_data()
+    df1, df24, df_all, active_stores = load_data()
     ts = build_ts(df24)
     print(f"\nDate range: {ts['Date'].min().date()} to {ts['Date'].max().date()}  | {len(ts)} days\n")
+    
+    # --- LLM Evidence Pack Generation ---
+    loc_stats = build_locality_intelligence(active_stores)
+    sku_city_ts = build_sku_city_ts(df24, loc_stats)
 
     l0       = L0_raw_snapshot(ts)
     l1, ts   = L1_baseline(ts)
@@ -1179,6 +1183,8 @@ def main():
     l9       = L9_attribution(ts, l4)
     l10      = L10_feedback(l1, l9, l4, len(ts))
     comp     = compare_two_days(df24, df_all, ts, COMPARE_DATE1, COMPARE_DATE2, l4)
+    
+    export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, out)
 
     report = {
         "meta": {"brand":BRAND_DISPLAY,"generated_at":datetime.now().isoformat(),
@@ -1207,6 +1213,173 @@ def main():
     print(f"Drop pattern: {l7['drop_pattern']}  |  Top driver: {l9.get('top_driver')}")
     print(f"Leading alerts: {l8['total_alerts']}")
     print(f"\n[OUTPUT FOLDER] {out}")
+
+
+
+def build_locality_intelligence(active_stores):
+    print("[LLM Evidence] Building locality intelligence from raw stores ...")
+    # Group by Date, City, Product ID to get locality statistics
+    loc_stats = active_stores.groupby(["Date", "city_key", "Product ID"]).agg(
+        Darkstore_Count=("Store ID", "size"),
+        Avg_Locality_Score=("Locality Sales Contribution", "mean"),
+        Max_Locality_Score=("Locality Sales Contribution", "max"),
+        Min_Locality_Score=("Locality Sales Contribution", "min"),
+        High_Value_Store_Count=("Is_High_Value", "sum"),
+        Network_Strength=("Locality Sales Contribution", "sum")
+    ).reset_index()
+    
+    # Calculate P75 and HHI separately as they require custom functions
+    def p75(x):
+        return x.quantile(0.75) if len(x) > 0 else 0
+        
+    def hhi(x):
+        total = x.sum()
+        if total == 0: return 0
+        shares = (x / total) * 100
+        return (shares ** 2).sum()
+
+    custom_stats = active_stores.groupby(["Date", "city_key", "Product ID"])["Locality Sales Contribution"].agg([
+        ("P75_Locality_Score", p75),
+        ("HHI", hhi)
+    ]).reset_index()
+    
+    loc_stats = loc_stats.merge(custom_stats, on=["Date", "city_key", "Product ID"], how="left")
+    loc_stats["Low_Value_Store_Count"] = loc_stats["Darkstore_Count"] - loc_stats["High_Value_Store_Count"]
+    loc_stats["High_Value_Store_Pct"] = (loc_stats["High_Value_Store_Count"] / loc_stats["Darkstore_Count"] * 100).fillna(0)
+    
+    return loc_stats
+
+def build_sku_city_ts(df24, loc_stats):
+    print("[LLM Evidence] Building SKU x City time-series ...")
+    
+    # Base SKU x City stats from df24
+    base = df24.groupby(["Date", "City", "city_key", "Product ID", "Product Name", "Grammage"]).agg(
+        Revenue=("Offtake MRP", "sum"),
+        OSA=("Wt. OSA %", "mean"),
+        Discount=("Wt. Discount %", "mean"),
+        Ad_SOV=("Ad SOV", "mean")
+    ).reset_index()
+    
+    # Determine tier
+    base["Tier"] = base["City"].str.lower().str.strip().apply(lambda c: "Metro" if c in METRO else "Tier2/3")
+    
+    # Merge with locality stats
+    full = base.merge(loc_stats, on=["Date", "city_key", "Product ID"], how="left").fillna({
+        "Darkstore_Count": 0, "Avg_Locality_Score": 0, "Max_Locality_Score": 0, 
+        "Min_Locality_Score": 0, "High_Value_Store_Count": 0, "Network_Strength": 0,
+        "P75_Locality_Score": 0, "HHI": 0, "Low_Value_Store_Count": 0, "High_Value_Store_Pct": 0
+    })
+    
+    # Re-scale Network Strength to match existing logic (* 100)
+    full["Network_Strength"] = full["Network_Strength"] * 100
+    
+    # Calculate DoD changes
+    full = full.sort_values(["Product ID", "City", "Date"])
+    
+    for col in ["Revenue", "Network_Strength", "Darkstore_Count", "Avg_Locality_Score"]:
+        full[f"{col}_DoD"] = full.groupby(["Product ID", "City"])[col].diff().fillna(0)
+        
+    # Calculate National Shares
+    national_day_sku = full.groupby(["Date", "Product ID"]).agg(
+        Nat_Rev=("Revenue", "sum"),
+        Nat_Net=("Network_Strength", "sum")
+    ).reset_index()
+    
+    full = full.merge(national_day_sku, on=["Date", "Product ID"], how="left")
+    full["City_Revenue_Share_Pct"] = (full["Revenue"] / full["Nat_Rev"] * 100).fillna(0)
+    full["City_Network_Share_Pct"] = (full["Network_Strength"] / full["Nat_Net"] * 100).fillna(0)
+    
+    full = full.drop(columns=["Nat_Rev", "Nat_Net"])
+    
+    return full
+
+def export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, outdir):
+    print("[LLM Evidence] Exporting evidence pack ...")
+    
+    import pandas as pd
+    import json
+    
+    excel_path = outdir / "llm_evidence_pack.xlsx"
+    json_path = outdir / "llm_evidence_pack.json"
+    
+    # Sheet 1: Daily National
+    daily_nat = ts.copy()
+    if "daily" in l6:
+        l6_df = pd.DataFrame(l6["daily"])
+        if not l6_df.empty and "Date_str" in l6_df.columns:
+            l6_df["Date"] = pd.to_datetime(l6_df["Date_str"])
+            daily_nat = daily_nat.merge(l6_df[["Date", "Total_Cat_Rev", "Brand_Share_Pct", "Cat_DoD", "Brand_DoD"]], on="Date", how="left")
+    
+    # Sheet 2: SKU x City x Day is exactly sku_city_ts
+    
+    # Sheet 3: SKU x Day Summary
+    sku_day = sku_city_ts.groupby(["Date", "Product ID", "Product Name", "Grammage"]).agg(
+        Revenue=("Revenue", "sum"),
+        OSA=("OSA", "mean"),
+        Discount=("Discount", "mean"),
+        Network_Strength=("Network_Strength", "sum"),
+        Darkstores=("Darkstore_Count", "sum"),
+        Revenue_DoD=("Revenue_DoD", "sum"),
+        Network_DoD=("Network_Strength_DoD", "sum")
+    ).reset_index()
+    
+    # Sheet 4: City x Day Summary
+    city_day = sku_city_ts.groupby(["Date", "City"]).agg(
+        Revenue=("Revenue", "sum"),
+        OSA=("OSA", "mean"),
+        Network_Strength=("Network_Strength", "sum"),
+        Darkstores=("Darkstore_Count", "sum")
+    ).reset_index()
+    
+    # Sheet 5: Comparison
+    d1_str, d2_str = comp.get("comparison_dates", {}).get("d1"), comp.get("comparison_dates", {}).get("d2")
+    comp_df = pd.DataFrame()
+    if d1_str and d2_str:
+        d1 = pd.Timestamp(d1_str)
+        d2 = pd.Timestamp(d2_str)
+        s1 = sku_city_ts[sku_city_ts["Date"] == d1]
+        s2 = sku_city_ts[sku_city_ts["Date"] == d2]
+        
+        comp_df = s1.merge(s2, on=["Product ID", "Product Name", "Grammage", "City"], suffixes=("_d1", "_d2"), how="outer").fillna(0)
+        comp_df["Revenue_Delta"] = comp_df["Revenue_d2"] - comp_df["Revenue_d1"]
+        comp_df["Network_Delta"] = comp_df["Network_Strength_d2"] - comp_df["Network_Strength_d1"]
+        comp_df["Store_Delta"] = comp_df["Darkstore_Count_d2"] - comp_df["Darkstore_Count_d1"]
+        comp_df["Locality_Delta"] = comp_df["Avg_Locality_Score_d2"] - comp_df["Avg_Locality_Score_d1"]
+        
+    # Sheet 6: Locality Intelligence is sku_city_ts with specific columns
+    loc_intel_cols = ["Date", "Product ID", "Product Name", "City", "High_Value_Store_Count", "Low_Value_Store_Count", 
+                      "Max_Locality_Score", "Min_Locality_Score", "P75_Locality_Score", "HHI", "High_Value_Store_Pct"]
+    loc_intel = sku_city_ts[loc_intel_cols].copy()
+    
+    # Sheet 7: Attributions
+    attr_df = pd.DataFrame(l9.get("driver_attributions", []))
+    
+    # Write to Excel
+    with pd.ExcelWriter(excel_path) as writer:
+        daily_nat.to_excel(writer, sheet_name="daily_national", index=False)
+        sku_city_ts.to_excel(writer, sheet_name="sku_city_day", index=False)
+        sku_day.to_excel(writer, sheet_name="sku_day_summary", index=False)
+        city_day.to_excel(writer, sheet_name="city_day_summary", index=False)
+        comp_df.to_excel(writer, sheet_name="sku_city_comparison", index=False)
+        loc_intel.to_excel(writer, sheet_name="locality_intelligence", index=False)
+        if not attr_df.empty:
+            attr_df.to_excel(writer, sheet_name="driver_attributions", index=False)
+            
+    # Write to JSON
+    json_data = {
+        "meta": {
+            "llm_prompt_hint": "Analyze the sku_city_day and locality_intelligence data to find which SKUs lost high-value darkstores, and which cities are underperforming despite high network capacity."
+        },
+        "daily_national": daily_nat.assign(Date=daily_nat["Date"].dt.strftime("%Y-%m-%d")).to_dict(orient="records"),
+        "sku_city_day": sku_city_ts.assign(Date=sku_city_ts["Date"].dt.strftime("%Y-%m-%d")).to_dict(orient="records"),
+        "locality_intelligence": loc_intel.assign(Date=loc_intel["Date"].dt.strftime("%Y-%m-%d")).to_dict(orient="records")
+    }
+    
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(json_data, f, indent=2, default=str)
+        
+    print(f"    -> {excel_path.name}")
+    print(f"    -> {json_path.name}")
 
 
 if __name__ == "__main__":
