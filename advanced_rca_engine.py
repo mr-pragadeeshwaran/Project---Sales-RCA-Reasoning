@@ -1,0 +1,1213 @@
+"""
+Advanced Sales RCA Engine -- 24 Mantra Organic (Blinkit)
+10-Layer architecture. Outputs timestamped folder + LLM brief.
+Run: python advanced_rca_engine.py
+"""
+import json, os, warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+
+warnings.filterwarnings("ignore")
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+FILE1  = r"D:\2. Area\24 Mantra\April-26\Sales RCA\blinkit-availability-data-april26-day wise.csv"
+FILE2  = r"D:\2. Area\24 Mantra\April-26\Sales RCA\blinkit-rca-download-April-26-Daily-City-Comp.csv"
+OUTDIR = r"c:\Users\cpsge\.gemini\antigravity\scratch\Project - Sales RCA Reasoning\output"
+
+BRAND_RAW    = "24 mantra organic"        # as stored in data (lowercase)
+BRAND_DISPLAY= "24 Mantra Organic"        # for display / reports
+
+COMPARE_DATE1 = "2026-04-19"
+COMPARE_DATE2 = "2026-04-20"
+
+THR = {
+    "OSA_critical":      65.0,
+    "OSA_warning":       75.0,
+    "Discount_dimret":   20.0,
+    "SOV_saturation":    40.0,
+    "Dark_metro_min":    30,
+    "Pullforward_ratio": 0.5,
+    "Anomaly_z":         2.0,
+    "Trend_days":        2,
+}
+METRO = {"mumbai","delhi-ncr","bangalore","chennai","hyderabad","kolkata","pune","ahmedabad"}
+
+# ── OUTPUT FOLDER ─────────────────────────────────────────────────────────────
+def make_output_dir() -> Path:
+    ts  = datetime.now().strftime("%B %d-%Y %I-%M %p")  # e.g. April 22-2026 12-01 AM
+    out = Path(OUTDIR) / f"RCA_{ts}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+# ── DATA LOADING ──────────────────────────────────────────────────────────────
+def load_data():
+    print("[LOAD] Reading File 1 (availability) ...")
+    c1 = ["Date","Store ID","Product ID","Brand","Item ID","Title","Grammage",
+          "BGR","Locality City","Locality","Listing %","Avg. OSA %","MRP","SP",
+          "Wt. Disc %","SKU Stock Levels","Locality Sales Contribution","Product_type"]
+    df1 = pd.read_csv(FILE1, usecols=c1, parse_dates=["Date"], low_memory=False)
+    df1["Brand"] = df1["Brand"].str.lower().str.strip()
+    df1 = df1[df1["Brand"] == BRAND_RAW].copy()
+    df1["Locality City"] = df1["Locality City"].str.lower().str.strip()
+
+    print("[LOAD] Reading File 2 (RCA metrics) ...")
+    c2 = ["Date","Product ID","Item ID","Product Name","Grammage","Category","City","Brand",
+          "Offtake MRP","Offtake SP","SP","MRP","Units","Wt. OSA %","Wt. Discount %",
+          "Category Share","Est. Category Share SP","Overall SOV","Organic SOV","Ad SOV",
+          "Wt. PPU (x100)","Product_type"]
+    df_all = pd.read_csv(FILE2, usecols=c2, parse_dates=["Date"], low_memory=False)
+    df_all["Brand"] = df_all["Brand"].str.lower().str.strip()
+
+    active_stores = df1[df1["Avg. OSA %"] == 100.0].copy()
+    active_stores["Is_High_Value"] = (active_stores["Locality Sales Contribution"] >= 0.00168).astype(int)
+    
+    # Fix City mapping for Delhi-NCR
+    ncr_cities = ["delhi", "new delhi", "noida", "gurgaon", "gurugram", "faridabad", "ghaziabad"]
+    active_stores["city_key"] = active_stores["Locality City"].str.lower().str.strip()
+    active_stores["city_key"] = active_stores["city_key"].apply(lambda c: "delhi-ncr" if c in ncr_cities else c)
+    
+    dark = active_stores.groupby(["Date","city_key","Product ID"]).agg(
+        Darkstore_Count=("Store ID", "size"),
+        Network_Strength=("Locality Sales Contribution", "sum"),
+        High_Value_Darkstores=("Is_High_Value", "sum")
+    ).reset_index()
+    dark["Network_Strength"] = dark["Network_Strength"] * 100
+
+    df_all["city_key"] = df_all["City"].str.lower().str.strip()
+    df_all = df_all.merge(dark, left_on=["Date","city_key","Product ID"],
+                          right_on=["Date","city_key","Product ID"], how="left")
+    df_all["Darkstore_Count"] = df_all["Darkstore_Count"].fillna(0)
+    df_all["Network_Strength"] = df_all["Network_Strength"].fillna(0)
+    df_all["High_Value_Darkstores"] = df_all["High_Value_Darkstores"].fillna(0)
+
+    df24 = df_all[df_all["Brand"] == BRAND_RAW].copy()
+    print(f"    File1 rows: {len(df1):,}  |  File2 (24M): {len(df24):,}  |  All brands: {len(df_all):,}")
+    return df1, df24, df_all, active_stores
+
+
+# ── NATIONAL TIME-SERIES ──────────────────────────────────────────────────────
+def build_ts(df24: pd.DataFrame) -> pd.DataFrame:
+    ts = (df24.groupby("Date").agg(
+            Revenue    =("Offtake MRP","sum"),
+            Units      =("Units","sum"),
+            OSA        =("Wt. OSA %","mean"),
+            Discount   =("Wt. Discount %","mean"),
+            Ad_SOV     =("Ad SOV","mean"),
+            Overall_SOV=("Overall SOV","mean"),
+            Cat_Share  =("Category Share","mean"),
+            Darkstores =("Darkstore_Count","sum"),
+            Network_Strength =("Network_Strength","sum"),
+            High_Value_Darkstores =("High_Value_Darkstores","sum"),
+          ).reset_index().sort_values("Date"))
+    ts["Day_Num"] = (ts["Date"] - ts["Date"].min()).dt.days
+    ts["DOW"]     = ts["Date"].dt.dayofweek
+    return ts
+
+
+# ── LAYER 0: RAW DAILY SNAPSHOT (evidence-first) ─────────────────────────────
+def L0_raw_snapshot(ts: pd.DataFrame, n: int = 7) -> dict:
+    """
+    Raw daily metrics for the last N days.
+    This is the evidence base — every insight in L1-L10 must be
+    traceable back to these numbers.
+    """
+    print(f"[L0] Raw daily snapshot (last {n} days) ...")
+    last_n = ts.tail(n).copy()
+    rows   = []
+    for _, r in last_n.iterrows():
+        rows.append({
+            "date":       r["Date"].strftime("%b %d"),
+            "date_full":  r["Date"].strftime("%Y-%m-%d"),
+            "dow":        r["Date"].strftime("%a"),
+            "revenue_rs": round(float(r["Revenue"]), 0),
+            "revenue_L":  f"{float(r['Revenue'])/100000:.1f}L",
+            "OSA":        round(float(r["OSA"]),       2) if not pd.isna(r["OSA"])       else None,
+            "Darkstores": int(r["Darkstores"])              if not pd.isna(r["Darkstores"]) else None,
+            "Ad_SOV":     round(float(r["Ad_SOV"]),    2) if not pd.isna(r["Ad_SOV"])    else None,
+            "Discount":   round(float(r["Discount"]),  2) if not pd.isna(r["Discount"])  else None,
+        })
+    # Print a readable table to console
+    hdr = f"{'Date':<10} {'DOW':<4} {'Revenue':>10}  {'OSA':>7}  {'Darkstores':>11}  {'Ad SOV':>7}  {'Discount':>9}"
+    print("    " + hdr)
+    print("    " + "-"*len(hdr))
+    for r in rows:
+        rev_str = f"Rs.{r['revenue_rs']:,.0f} ({r['revenue_L']})"
+        print(f"    {r['date']:<10} {r['dow']:<4} {rev_str:>22}  {str(r['OSA']):>7}  {str(r['Darkstores']):>11}  {str(r['Ad_SOV']):>7}  {str(r['Discount']):>9}")
+
+    # DoD changes for last row vs second-last
+    dods = {}
+    if len(rows) >= 2:
+        d2, d1 = rows[-1], rows[-2]
+        for col in ["revenue_rs","OSA","Darkstores","Ad_SOV","Discount"]:
+            if d1[col] is not None and d2[col] is not None and d1[col] != 0:
+                dods[col] = round((d2[col]-d1[col])/abs(d1[col])*100, 1)
+
+    return {"last_n_days": rows, "dod_changes": dods, "n": n}
+
+
+
+def L1_baseline(ts: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    print("[L1] Baseline decomposition ...")
+    if len(ts) < 7:
+        return {"note": "Need >=7 days"}, ts
+
+    y  = ts["Revenue"].values.astype(float)
+    x  = ts["Day_Num"].values.reshape(-1,1)
+    lr = LinearRegression().fit(x, y)
+    trend     = lr.predict(x)
+    detrended = y - trend
+    dow       = ts["DOW"].values
+    dow_fx    = np.array([detrended[dow==d].mean() if (dow==d).any() else 0 for d in dow])
+    residual  = detrended - dow_fx
+
+    ts = ts.copy()
+    ts["Trend"]    = trend
+    ts["DOW_FX"]   = dow_fx
+    ts["Residual"] = residual
+    ts["Resid_Z"]  = stats.zscore(residual) if residual.std() > 0 else np.zeros(len(residual))
+
+    anom = ts[ts["Resid_Z"].abs() > THR["Anomaly_z"]]
+    result = {
+        "trend_slope_day":    round(float(lr.coef_[0]), 2),
+        "trend_r2":           round(float(lr.score(x,y)), 4),
+        "dow_effects":        {str(d): round(float(detrended[dow==d].mean()),2)
+                               for d in range(7) if (dow==d).any()},
+        "true_anomaly_dates": anom["Date"].dt.strftime("%Y-%m-%d").tolist(),
+        "anomaly_details":    anom[["Date","Revenue","Resid_Z"]].assign(
+                                Date=lambda d: d["Date"].dt.strftime("%Y-%m-%d"),
+                                Revenue=lambda d: d["Revenue"].round(0),
+                                Resid_Z=lambda d: d["Resid_Z"].round(2)
+                              ).to_dict(orient="records"),
+    }
+    print(f"    Slope: Rs.{result['trend_slope_day']}/day | Anomalies: {len(anom)}")
+    return result, ts
+
+
+# ── LAYER 4: LAG ANALYSIS ─────────────────────────────────────────────────────
+def L4_lag(ts: pd.DataFrame) -> dict:
+    print("[L4] Lag correlation ...")
+    result = {}
+    for col in ["OSA","Discount","Ad_SOV","Network_Strength"]:
+        best_lag, best_r, best_p = 0, 0.0, 1.0
+        table = []
+        for lag in range(4):
+            sh   = ts[col].shift(lag)
+            mask = sh.notna() & ts["Revenue"].notna()
+            if mask.sum() < 5: continue
+            r, p = stats.pearsonr(sh[mask], ts["Revenue"][mask])
+            table.append({"lag_days": lag, "r": round(float(r),4), "p": round(float(p),4)})
+            if abs(r) > abs(best_r): best_lag, best_r, best_p = lag, r, p
+
+        # Build explicit lag validation examples (last 3 pairs)
+        lag_examples = []
+        for i in range(max(0, len(ts)-3-best_lag), len(ts)-best_lag):
+            if i < 0 or i+best_lag >= len(ts): continue
+            driver_date = ts.iloc[i]["Date"].strftime("%b %d")
+            rev_date    = ts.iloc[i+best_lag]["Date"].strftime("%b %d")
+            driver_val  = ts.iloc[i][col]
+            rev_val     = ts.iloc[i+best_lag]["Revenue"]
+            if pd.isna(driver_val) or pd.isna(rev_val): continue
+            lag_examples.append(
+                f"{driver_date} {col}={driver_val:.2f} -> {rev_date} Revenue=Rs.{rev_val:,.0f}"
+            )
+
+        result[col] = {
+            "best_lag_days":   best_lag,
+            "best_r":          round(float(best_r),4),
+            "best_p":          round(float(best_p),4),
+            "significant":     best_p < 0.05,
+            "direction":       "positive" if best_r > 0 else "negative",
+            "lag_table":       table,
+            "lag_validation":  lag_examples,
+        }
+        print(f"    {col}: lag={best_lag}d  r={best_r:.3f}  p={best_p:.3f}")
+        for ex in lag_examples:
+            print(f"        {ex}")
+    return result
+
+
+# ── LAYER 2: DRIVER INTERACTIONS ──────────────────────────────────────────────
+def L2_interactions(ts):
+    print("[L2] Driver interactions ...")
+    latest = ts.iloc[-1]
+    osa  = float(latest["OSA"])        if not pd.isna(latest["OSA"])        else 0
+    disc = float(latest["Discount"])   if not pd.isna(latest["Discount"])   else 0
+    sov  = float(latest["Ad_SOV"])     if not pd.isna(latest["Ad_SOV"])     else 0
+    dark = float(latest["Network_Strength"]) if not pd.isna(latest["Network_Strength"]) else 0
+    checks = [
+        ("SOV x OSA wastage",          sov>5 and osa<THR["OSA_warning"],  "HIGH",
+         f"Ad SOV {sov:.1f}% active but OSA only {osa:.1f}% -- product unavailable. SOV wasted. Fix OSA first."),
+        ("OSA x Discount double-penalty", osa<THR["OSA_critical"] and disc<5, "HIGH",
+         f"Critical OSA {osa:.1f}% AND low Discount {disc:.1f}% -- compounding drag, both need urgent fix."),
+        ("Discount x Net Strength",      disc>10 and dark<80, "MEDIUM",
+         f"Discount {disc:.1f}% running but Network Strength is only {dark:.0f}% -- promo not reaching potential."),
+        ("SOV x OSA amplified",        sov>10 and osa>THR["OSA_warning"],  "POSITIVE",
+         f"High SOV {sov:.1f}% + healthy OSA {osa:.1f}% -- both levers aligned, amplified impact."),
+    ]
+    active    = [c for c in checks if c[1]]
+    warnings  = [c[3] for c in active if c[2] in ("HIGH","MEDIUM")]
+    positives = [c[3] for c in active if c[2]=="POSITIVE"]
+    print(f"    Active: {len(active)}  Warnings: {len(warnings)}")
+    return {"interactions":[{"pair":c[0],"severity":c[2],"insight":c[3]} for c in active],
+            "warnings":warnings,"positives":positives}
+
+
+# ── LAYER 3: THRESHOLD LOGIC ──────────────────────────────────────────────────
+def L3_thresholds(ts, lag):
+    print("[L3] Thresholds + zone context ...")
+    latest = ts.iloc[-1]
+    # Zone definitions per driver
+    zone_defs = {
+        "OSA":      [(75,  100, "SAFE",     ">75%   -> safe zone"),
+                     (65,   75, "RISK",     "65-75% -> risk zone (drag starts)"),
+                     (0,    65, "CRITICAL", "<65%   -> critical zone (collapse risk)")],
+        "Discount": [(0,   16,  "SAFE",     "<16%   -> safe zone"),
+                     (16,  20,  "RISK",     "16-20% -> risk zone (dimret starting)"),
+                     (20, 100,  "CRITICAL", ">20%   -> critical zone (base sales erode)")],
+        "Ad_SOV":   [(0,   28,  "SAFE",     "<28%   -> normal spend"),
+                     (28,  40,  "RISK",     "28-40% -> diminishing returns"),
+                     (40, 100,  "CRITICAL", ">40%   -> saturation, cut spend")],
+    }
+    cfg = {
+        "OSA":      ("OSA",     THR["OSA_critical"],   THR["OSA_warning"],       "below_bad"),
+        "Discount": ("Discount",THR["Discount_dimret"], THR["Discount_dimret"]*0.8,"above_bad"),
+        "Ad_SOV":   ("Ad_SOV",  THR["SOV_saturation"], THR["SOV_saturation"]*0.7, "above_dimret"),
+    }
+    result = {}
+    for name,(col,crit,warn,dir_) in cfg.items():
+        val       = float(latest[col]) if not pd.isna(latest[col]) else None
+        below_avg = ts[ts[col]< crit]["Revenue"].mean()
+        above_avg = ts[ts[col]>=crit]["Revenue"].mean()
+        pen = (round((float(above_avg-below_avg)/float(above_avg)*100),1)
+               if (above_avg and not np.isnan(above_avg) and above_avg>0) else None)
+        status = ("CRITICAL" if (dir_=="below_bad" and val is not None and val<crit) else
+                  "WARNING"  if (dir_=="below_bad" and val is not None and val<warn) else
+                  "CRITICAL" if (dir_=="above_bad" and val is not None and val>crit) else
+                  "WARNING"  if (dir_=="above_bad" and val is not None and val>warn) else
+                  "MONITOR"  if dir_=="above_dimret" else "OK")
+        # Determine which zone current value sits in
+        current_zone = "UNKNOWN"
+        for lo, hi, zname, zdesc in zone_defs.get(name, []):
+            if val is not None and lo <= val < hi:
+                current_zone = zname
+                break
+        # Trend: last 3 days of this driver
+        trend_vals = []
+        for _, row in ts.tail(3).iterrows():
+            v = row[col]
+            trend_vals.append({
+                "date": row["Date"].strftime("%b %d"),
+                "value": round(float(v), 2) if not pd.isna(v) else None
+            })
+        result[name] = {
+            "current":         val,
+            "critical":        crit,
+            "warning":         warn,
+            "status":          status,
+            "current_zone":    current_zone,
+            "zone_bands":      zone_defs.get(name, []),
+            "sales_penalty_pct": pen,
+            "best_lag_days":   lag.get(col, lag.get(name,{})).get("best_lag_days",0),
+            "last_3_days":     trend_vals,
+        }
+        zone_str = f"[{current_zone}]" if current_zone else ""
+        print(f"    {name}: {val:.2f}% -> {status} {zone_str}")
+        for t in trend_vals:
+            print(f"        {t['date']}: {t['value']}")
+    return result
+
+
+# ── LAYER 5: PULLFORWARD ──────────────────────────────────────────────────────
+def L5_pullforward(ts):
+    print("[L5] Pullforward filter ...")
+    pf, real = [], []
+    if len(ts)<3: return {"pullforward_events":pf,"real_drops":real}
+    y,disc,dt = ts["Revenue"].values,ts["Discount"].values,ts["Date"].dt.strftime("%Y-%m-%d").values
+    for i in range(1,len(y)-1):
+        if disc[i]-disc[i-1]>5 and y[i]>y[i-1]:
+            spike = (y[i]-y[i-1])/y[i-1] if y[i-1]>0 else 0
+            drop  = (y[i]-y[i+1])/y[i]   if y[i]>0   else 0
+            if drop>0:
+                ev={"spike_date":dt[i],"drop_date":dt[i+1],
+                    "spike_pct":round(spike*100,1),"drop_pct":round(drop*100,1)}
+                (pf if drop<=spike*THR["Pullforward_ratio"] else real).append(ev)
+    print(f"    Pullforward: {len(pf)}  Real: {len(real)}")
+    return {"pullforward_events":pf,"real_drops":real}
+
+
+# -- LAYER 6: COMPETITIVE & MARKET SEPARATION ---------------------------------
+def L6_competitive(df24, df_all):
+    """
+    Category Share column = 24M's % share within a specific sub-category
+    (e.g. 6.46 means 24M holds 6.46% of the Jaggery category in that city).
+    It is already in PERCENTAGE format (0-100 scale).
+
+    Correct category revenue derivation:
+        Implied_Cat_Rev = Offtake_MRP / (Category_Share / 100)
+
+    To avoid double-counting (multiple 24M SKUs share the same category pool),
+    we group by (Date, City, Category) and take mean of implied values per group,
+    then sum groups to get total category revenue per day.
+    """
+    print("[L6] Competitive separation (correct category back-calc) ...")
+
+    valid = df24[
+        df24["Offtake MRP"].notna() &
+        df24["Category Share"].notna() &
+        (df24["Category Share"] > 0)
+    ].copy()
+    # Category Share is already %, e.g. 6.46 = 6.46%
+    valid["Implied_Cat_Rev"] = valid["Offtake MRP"] / (valid["Category Share"] / 100)
+
+    # Per (Date, City, Category): mean implied category revenue to avoid double-count
+    cat_grp = valid.groupby(["Date", "City", "Category"]).agg(
+        Brand_Rev_in_grp=("Offtake MRP", "sum"),
+        Cat_Rev_in_grp=("Implied_Cat_Rev", "mean"),
+    ).reset_index()
+
+    # Daily national totals
+    daily = cat_grp.groupby("Date").agg(
+        Brand_Rev=("Brand_Rev_in_grp", "sum"),
+        Total_Cat_Rev=("Cat_Rev_in_grp", "sum"),
+    ).reset_index().sort_values("Date")
+
+    daily["Brand_Share_Pct"] = daily["Brand_Rev"] / daily["Total_Cat_Rev"] * 100
+    daily["Cat_DoD"]         = daily["Total_Cat_Rev"].pct_change() * 100
+    daily["Brand_DoD"]       = daily["Brand_Rev"].pct_change() * 100
+    daily["Share_DoD"]       = daily["Brand_Share_Pct"].diff()
+    daily["Date_str"]        = daily["Date"].dt.strftime("%Y-%m-%d")
+
+    last      = daily.iloc[-1]
+    bdod      = float(last["Brand_DoD"])       if not pd.isna(last["Brand_DoD"])       else 0
+    cdod      = float(last["Cat_DoD"])         if not pd.isna(last["Cat_DoD"])         else 0
+    share     = float(last["Brand_Share_Pct"]) if not pd.isna(last["Brand_Share_Pct"]) else 0
+    share_chg = float(last["Share_DoD"])       if not pd.isna(last["Share_DoD"])       else 0
+
+    # Verdict: category is the true market benchmark
+    if bdod < 0 and cdod < 0 and abs(cdod) >= abs(bdod) * 0.7:
+        verdict = "MARKET_ISSUE"
+        expl    = (f"Both brand ({bdod:.1f}%) and category ({cdod:.1f}%) declined. "
+                   f"Market-level headwind, not specific to {BRAND_DISPLAY}.")
+    elif bdod < 0 and cdod > 0:
+        verdict = "OWN_ISSUE"
+        expl    = (f"Brand fell {bdod:.1f}% while category GREW {cdod:.1f}%. "
+                   f"Market was healthy -- this is entirely a {BRAND_DISPLAY} own-factor problem. "
+                   f"Share dropped {abs(share_chg):.2f} pts to {share:.2f}%.")
+    elif bdod < 0 and abs(cdod) < 2:
+        verdict = "OWN_ISSUE"
+        expl    = (f"Brand fell {bdod:.1f}% but category was flat ({cdod:.1f}%). "
+                   f"Own levers are the cause. Share dropped {abs(share_chg):.2f} pts to {share:.2f}%.")
+    elif bdod < cdod:
+        verdict = "OWN_ISSUE"
+        expl    = (f"Brand {bdod:.1f}% vs category {cdod:.1f}% -- "
+                   f"underperforming market. Share: {share:.2f}% ({share_chg:+.2f} pts).")
+    else:
+        verdict = "OUTPERFORMING"
+        expl    = (f"Brand {bdod:.1f}% vs category {cdod:.1f}% -- beating market. "
+                   f"Share: {share:.2f}% ({share_chg:+.2f} pts).")
+
+    print(f"    Verdict: {verdict}  Brand: {bdod:.1f}%  Category: {cdod:.1f}%  Share: {share:.2f}%")
+    return {
+        "daily": daily[["Date_str","Brand_Rev","Total_Cat_Rev","Brand_Share_Pct",
+                         "Cat_DoD","Brand_DoD","Share_DoD"]].round(2).to_dict(orient="records"),
+        "latest_verdict":     verdict,
+        "latest_explanation": expl,
+        "brand_dod":          round(bdod, 2),
+        "cat_dod":            round(cdod, 2),
+        "brand_share_pct":    round(share, 2),
+        "share_point_change": round(share_chg, 2),
+        "note": ("Category Share in data = 24M's % within each sub-category (Jaggery, Rice, etc). "
+                 "Total category revenue back-calculated per (Date,City,Category) group to avoid double-count."),
+    }
+
+# ── LAYER 7: GEOGRAPHIC CASCADE ───────────────────────────────────────────────
+def L7_geographic(df24, l6_verdict=""):
+    print("[L7] Geographic cascade ...")
+    city = (df24.groupby(["Date","City"]).agg(
+                Revenue=("Offtake MRP","sum"),OSA=("Wt. OSA %","mean"),
+                Discount=("Wt. Discount %","mean"),Ad_SOV=("Ad SOV","mean"),
+                Network_Strength=("Network_Strength","sum"))
+            .reset_index().sort_values(["City","Date"]))
+    city["Tier"] = city["City"].str.lower().str.strip().apply(lambda c:"Metro" if c in METRO else "Tier2/3")
+    dates = sorted(city["Date"].unique())
+    d2,d1 = dates[-1],(dates[-2] if len(dates)>1 else dates[-1])
+    last = city[city["Date"]==d2].copy()
+    prev = city[city["Date"]==d1][["City","Revenue"]].rename(columns={"Revenue":"Prev"})
+    last = last.merge(prev,on="City",how="left")
+    last["Change"] = last["Revenue"]-last["Prev"]
+    total_chg = float(last["Change"].sum())
+    keep = ["City","Tier","Revenue","Change","OSA","Ad_SOV","Network_Strength"]
+    losers  = last.nsmallest(5,"Change")[keep].round(1).to_dict(orient="records")
+    gainers = last.nlargest(5, "Change")[keep].round(1).to_dict(orient="records")
+    losing  = last[last["Change"]<0]
+    top2_share = (float(losing.nsmallest(2,"Change")["Change"].sum()/total_chg)
+                  if total_chg<0 and len(losing)>=2 else 0.0)
+    geo_pattern = "CONCENTRATED" if top2_share>0.7 else "SPREAD"
+
+    # OVERRIDE: if L6 already confirmed OWN_ISSUE (category grew, brand fell),
+    # geo SPREAD does NOT mean macro — it means the own-factor is national in scope
+    if l6_verdict == "OWN_ISSUE" and geo_pattern == "SPREAD":
+        effective_pattern = "SPREAD_OWN"
+        note = ("Drop spread nationally, BUT category grew on same day (L6=OWN_ISSUE). "
+                "SPREAD pattern here means the own-factor (OSA, darkstores, discount) "
+                "degraded across all cities simultaneously -- NOT a macro market issue.")
+    elif geo_pattern == "CONCENTRATED":
+        effective_pattern = "CONCENTRATED"
+        note = "Top 2 cities >70% of drop -- likely OPERATIONAL issue in those cities (OSA/darkstore outage)."
+    else:
+        effective_pattern = "SPREAD"
+        note = "Drop spread across cities -- consistent with macro/market issue."
+
+    print(f"    Geo pattern: {geo_pattern} (effective: {effective_pattern})  L6 override: {l6_verdict}")
+    return {"top_losing_cities":losers,"top_gaining_cities":gainers,
+            "drop_pattern":effective_pattern,"raw_geo_pattern":geo_pattern,
+            "drop_pattern_note":note,"total_national_change":round(total_chg,0)}
+
+
+# ── LAYER 8: LEADING INDICATORS ──────────────────────────────────────────────
+def L8_leading(ts, df24):
+    print("[L8] Leading indicators (with daily values) ...")
+    alerts, N = [], THR["Trend_days"]
+
+    def chk(series, label, col_name, direction, thr_delta, dates_series):
+        vals  = series.dropna().values
+        dates = dates_series[series.notna()].values
+        if len(vals) < N+1: return
+        recent_vals  = vals[-N:]
+        recent_dates = dates[-N:]
+        # Build daily trend string
+        trend_str = "  |  ".join(
+            f"{pd.Timestamp(d).strftime('%b %d')} = {v:.2f}"
+            for d, v in zip(recent_dates, recent_vals)
+        )
+        net_chg = float(recent_vals[-1] - recent_vals[0])
+        if direction == "down" and all(recent_vals[i] < recent_vals[i-1] for i in range(1, N)):
+            alerts.append({
+                "indicator":  label,
+                "alert":      f"{label} declined {N} consecutive days",
+                "daily_trend":trend_str,
+                "net_change": round(net_chg, 2),
+                "severity":   "HIGH" if abs(net_chg) > thr_delta else "MEDIUM",
+                "prediction": "Sales at risk in next 2-3 days if trend continues.",
+                "current":    round(float(recent_vals[-1]), 2),
+            })
+        elif direction == "up" and all(recent_vals[i] > recent_vals[i-1] for i in range(1, N)):
+            alerts.append({
+                "indicator":  label,
+                "alert":      f"{label} rising {N} days straight (pullforward risk)",
+                "daily_trend":trend_str,
+                "net_change": round(net_chg, 2),
+                "severity":   "MEDIUM",
+                "prediction": "Watch for demand pullforward correction.",
+                "current":    round(float(recent_vals[-1]), 2),
+            })
+
+    chk(ts["OSA"],              "National OSA (%)",   "OSA",              "down",  5, ts["Date"])
+    chk(ts["Ad_SOV"],           "Ad SOV (%)",         "Ad_SOV",           "down",  2, ts["Date"])
+    chk(ts["Network_Strength"], "Network Strength",   "Network_Strength", "down",  2, ts["Date"])
+    chk(ts["Discount"],         "Discount (%)",       "Discount",         "up",    5, ts["Date"])
+
+    city_osa = (df24.groupby(["Date","City"])["Wt. OSA %"].mean()
+                .reset_index().sort_values(["City","Date"]))
+    for city_name, grp in city_osa.groupby("City"):
+        vals  = grp["Wt. OSA %"].values
+        dates = grp["Date"].values
+        if len(vals) >= N+1:
+            recent_v = vals[-N:]
+            recent_d = dates[-N:]
+            if all(recent_v[i] < recent_v[i-1] for i in range(1, N)):
+                trend_str = "  |  ".join(
+                    f"{pd.Timestamp(d).strftime('%b %d')} = {v:.1f}%"
+                    for d, v in zip(recent_d, recent_v)
+                )
+                alerts.append({
+                    "indicator":   f"OSA:{city_name}",
+                    "alert":       f"{city_name} OSA declining {N} days straight",
+                    "daily_trend": trend_str,
+                    "net_change":  round(float(recent_v[-1]-recent_v[0]), 2),
+                    "severity":    "HIGH" if recent_v[-1] < THR["OSA_warning"] else "MEDIUM",
+                    "prediction":  f"Sales at risk in {city_name} within 2-3 days.",
+                    "current":     round(float(recent_v[-1]), 2),
+                })
+    print(f"    Alerts raised: {len(alerts)}")
+    for a in alerts[:5]:  # show first 5 in console
+        print(f"    [{a['severity']}] {a['alert']}")
+        print(f"        Trend: {a['daily_trend']}  (net {a['net_change']:+.2f})")
+    return {"alerts": alerts, "total_alerts": len(alerts)}
+
+# ── HISTORICAL EVIDENCE ───────────────────────────────────────────────────────
+def find_historical_evidence(ts, driver_col, target_delta, expected_impact, current_d1, current_d2):
+    if len(ts) < 5 or target_delta == 0: return None
+    
+    sign = 1 if target_delta > 0 else -1
+    min_mag = abs(target_delta) * 0.7
+    max_mag = abs(target_delta) * 1.3
+    
+    best_match, min_diff = None, float('inf')
+    
+    for i in range(1, len(ts)):
+        d1 = ts.iloc[i-1]["Date"]
+        d2 = ts.iloc[i]["Date"]
+        
+        if d1 >= pd.Timestamp(current_d1) or d2 >= pd.Timestamp(current_d1):
+            continue
+            
+        v1 = ts.iloc[i-1][driver_col]
+        v2 = ts.iloc[i][driver_col]
+        if pd.isna(v1) or pd.isna(v2): continue
+        
+        delta = v2 - v1
+        if delta * sign > 0 and min_mag <= abs(delta) <= max_mag:
+            rev1, rev2 = ts.iloc[i-1]["Revenue"], ts.iloc[i]["Revenue"]
+            rev_delta = rev2 - rev1
+            # Only accept history where revenue moved in the expected direction
+            if (expected_impact > 0 and rev_delta > 0) or (expected_impact < 0 and rev_delta < 0):
+                diff = abs(abs(delta) - abs(target_delta))
+                if diff < min_diff:
+                    min_diff = diff
+                    best_match = {"hist_d1": d1.strftime("%b %d"), "hist_d2": d2.strftime("%b %d"),
+                                  "driver_delta": delta, "rev_delta": rev_delta}
+                
+    if best_match:
+        dir_w = "dropped" if target_delta < 0 else "rose"
+        r_dir = "dropped" if best_match["rev_delta"] < 0 else "rose"
+        return (f"Historical Proof: {best_match['hist_d1']}->{best_match['hist_d2']}, {driver_col} {dir_w} "
+                f"by {abs(best_match['driver_delta']):.1f} causing Revenue to {r_dir} by Rs.{abs(best_match['rev_delta']):,.0f}.")
+    return "Historical Proof: No direct past match found validating this specific impact."
+
+# ── LAYER 9: FINANCIAL ATTRIBUTION ───────────────────────────────────────────
+def L9_attribution(ts, lag):
+    print("[L9] Financial attribution ...")
+    if len(ts)<3: return {"note":"Insufficient data"}
+    latest,prev = ts.iloc[-1],ts.iloc[-2]
+    total_delta = float(latest["Revenue"]-prev["Revenue"])
+    drivers = ["OSA","Discount","Ad_SOV","Network_Strength"]
+    sens = {d:abs(lag.get(d,{}).get("best_r",0)) for d in drivers}
+    tot  = sum(sens.values()) or 1
+    attr = []
+    for d in drivers:
+        curr = float(latest[d]) if not pd.isna(latest[d]) else 0
+        base = float(prev[d])   if not pd.isna(prev[d])   else 0
+        dd   = curr-base
+        w    = sens[d]/tot
+        impact = total_delta*w*(1 if dd*total_delta>=0 else -1)
+        hist_ev = find_historical_evidence(ts, d, dd, impact, prev["Date"], latest["Date"])
+        driver_name = d
+        custom_narrative = None
+        if d == "Network_Strength":
+            d_curr = latest["Darkstores"] if "Darkstores" in latest and not pd.isna(latest["Darkstores"]) else 0
+            d_base = prev["Darkstores"] if "Darkstores" in prev and not pd.isna(prev["Darkstores"]) else 0
+            dark_delta = d_curr - d_base
+            net_delta = dd
+            store_action = f"lost {abs(dark_delta):.0f}" if dark_delta < 0 else (f"gained {dark_delta:.0f}" if dark_delta > 0 else "saw no change in")
+            cap_action = f"wiped out {abs(net_delta):.1f}%" if net_delta < 0 else (f"added {net_delta:.1f}%" if net_delta > 0 else "didn't change")
+            imp_action = f"causing a drop of Rs. {abs(impact):,.0f}" if impact < 0 else f"driving a gain of Rs. {abs(impact):,.0f}"
+            custom_narrative = f"You {store_action} physical stores, which {cap_action} of your sales capacity ({base:.1f}% -> {curr:.1f}%), {imp_action}."
+            driver_name = "Network_Capacity"
+
+        attr.append({"driver":driver_name,"current":round(curr,2),"baseline":round(base,2),
+                     "driver_delta":round(dd,2),"revenue_impact_rs":round(impact,0),
+                     "share_pct":round(impact/total_delta*100,1) if total_delta!=0 else 0,
+                     "weight":round(w,4),"lag_days":lag.get(d,{}).get("best_lag_days",0),
+                     "historical_evidence": hist_ev, "custom_narrative": custom_narrative})
+    attr.sort(key=lambda x:abs(x["revenue_impact_rs"]),reverse=True)
+    top = attr[0]["driver"] if attr else "Unknown"
+    print(f"    Delta: Rs.{total_delta:.0f}  Top: {top}")
+    return {"total_delta_rs":round(total_delta,0),
+            "analysis_date":latest["Date"].strftime("%Y-%m-%d"),
+            "baseline_date":prev["Date"].strftime("%Y-%m-%d"),
+            "driver_attributions":attr,"top_driver":top}
+
+
+# ── LAYER 10: CONFIDENCE & FEEDBACK ──────────────────────────────────────────
+def L10_feedback(l1, l9, lag, n_days):
+    print("[L10] Confidence scoring ...")
+    r2    = l1.get("trend_r2", 0)
+    top   = l9.get("top_driver", "OSA")
+    top_r = abs(lag.get(top, {}).get("best_r", 0))
+    n_an  = len(l1.get("true_anomaly_dates", []))
+    score = min(100, int(r2*30 + top_r*40 + min(n_days,30)/30*20 + (10 if n_an>0 else 5)))
+
+    # Build explicit reasons
+    reasons, actions = [], []
+    if n_days < 30:
+        reasons.append(f"Only {n_days} days of data (need 30+ for strong stats)")
+        actions.append("Accumulate 30+ days then re-run for higher confidence")
+    if r2 < 0.1:
+        reasons.append(f"Trend R2={r2:.3f} (very low -- linear trend barely fits data)")
+        actions.append("Treat trend slope as directional only, not precise")
+    if top_r < 0.5:
+        reasons.append(f"Top driver correlation r={top_r:.3f} (moderate -- not definitive)")
+        actions.append("Cross-validate with ops team before large interventions")
+    for d in ["OSA","Discount","Ad_SOV","Network_Strength"]:
+        info = lag.get(d, {})
+        if not info.get("significant", False):
+            reasons.append(f"{d} lag correlation not statistically significant (p={info.get('best_p',1):.3f})")
+    if n_an == 0:
+        reasons.append("No true statistical anomalies detected (drops within expected variance)")
+        actions.append("Focus on trend direction rather than single-day anomaly investigation")
+
+    interp = ("HIGH -- trust this RCA for decisions" if score >= 70
+              else "MEDIUM -- directionally correct, validate 1-2 key claims" if score >= 50
+              else "LOW -- use as hypothesis only, validate with raw data before acting")
+
+    guardrail = (
+        f"WARNING: Confidence is LOW ({score}%). "
+        f"Before acting on this RCA: (1) Check L0 raw table to verify numbers, "
+        f"(2) Ask ops team if any external event occurred on these dates, "
+        f"(3) Do not increase/cut ad spend based on this alone."
+        if score < 50 else
+        f"MEDIUM confidence ({score}%). Directional findings are reliable. "
+        f"Validate the top driver before large budget moves."
+        if score < 70 else
+        f"HIGH confidence ({score}%). RCA findings are statistically grounded."
+    )
+
+    print(f"    Confidence: {score}%  ({interp.split(' --')[0]})")
+    for r in reasons:
+        print(f"        Reason: {r}")
+
+    return {
+        "confidence_score":   score,
+        "interpretation":     interp,
+        "guardrail_message":  guardrail,
+        "reasons_for_score":  reasons,
+        "recommended_actions":actions,
+        "factors": {
+            "trend_r2":         round(r2, 4),
+            "top_driver_r":     round(top_r, 4),
+            "days_of_data":     n_days,
+            "anomalies_detected": n_an,
+        },
+        "override_instructions":
+            "Add wrong findings to feedback_overrides.json: "
+            "{date, driver, actual_cause, exclude_from_training:true}",
+    }
+
+
+# ── SKU DEEP DIVE ─────────────────────────────────────────
+
+def sku_deep_dive(df24, df_all, sku_id, sku_name, d1_str, d2_str):
+    sku_df = df24[df24["Product ID"] == sku_id].copy()
+    if sku_df.empty: return {}
+    
+    category = sku_df["Category"].iloc[0] if "Category" in sku_df.columns else "Unknown"
+    
+    ts = sku_df.groupby("Date").agg(
+        Revenue=("Offtake MRP","sum"), OSA=("Wt. OSA %","mean"),
+        Discount=("Wt. Discount %","mean"), Ad_SOV=("Ad SOV","mean"),
+        Darkstores=("Darkstore_Count","sum"), Network_Strength=("Network_Strength","sum")).reset_index().sort_values("Date")
+    
+    d1, d2 = pd.Timestamp(d1_str), pd.Timestamp(d2_str)
+    s1, s2 = ts[ts["Date"]==d1], ts[ts["Date"]==d2]
+    if s1.empty or s2.empty: return {}
+    s1, s2 = s1.iloc[0], s2.iloc[0]
+    
+    rev_delta = s2["Revenue"] - s1["Revenue"]
+    drivers = ["OSA", "Discount", "Ad_SOV", "Network_Strength"]
+    sens = {}
+    for col in drivers:
+        best_r = 0
+        for lag in range(4):
+            sh = ts[col].shift(lag)
+            mask = sh.notna() & ts["Revenue"].notna()
+            if mask.sum() > 3:
+                r, p = stats.pearsonr(sh[mask], ts["Revenue"][mask])
+                if not np.isnan(r) and abs(r) > abs(best_r): best_r = r
+        sens[col] = abs(best_r)
+        
+    tot = sum(sens.values()) or 1
+    attr = []
+    for d in drivers:
+        curr = s2[d] if not pd.isna(s2[d]) else 0
+        base = s1[d] if not pd.isna(s1[d]) else 0
+        dd = curr - base
+        w = sens[d] / tot
+        imp = rev_delta * w * (1 if dd*rev_delta >= 0 else -1)
+        hist_ev = find_historical_evidence(ts, d, dd, imp, d1_str, d2_str)
+        
+        driver_name = d
+        custom_narrative = None
+        if d == "Network_Strength":
+            d_curr = s2["Darkstores"] if not pd.isna(s2["Darkstores"]) else 0
+            d_base = s1["Darkstores"] if not pd.isna(s1["Darkstores"]) else 0
+            dark_delta = d_curr - d_base
+            net_delta = curr - base
+            store_action = f"lost {abs(dark_delta):.0f}" if dark_delta < 0 else (f"gained {dark_delta:.0f}" if dark_delta > 0 else "saw no change in")
+            cap_action = f"wiped out {abs(net_delta):.1f}%" if net_delta < 0 else (f"added {net_delta:.1f}%" if net_delta > 0 else "didn't change")
+            imp_action = f"causing a drop of Rs. {abs(imp):,.0f}" if imp < 0 else f"driving a gain of Rs. {abs(imp):,.0f}"
+            custom_narrative = f"You {store_action} physical stores, which {cap_action} of your sales capacity ({base:.1f}% -> {curr:.1f}%), {imp_action}."
+            driver_name = "Network_Capacity"
+        
+        attr.append({"driver": driver_name, "d1_val": round(base, 2), "d2_val": round(curr, 2),
+                     "delta": round(dd, 2), "impact_rs": round(imp, 0),
+                     "weight": round(w, 2), "historical_evidence": hist_ev, "custom_narrative": custom_narrative})
+        
+    attr.sort(key=lambda x: abs(x["impact_rs"]), reverse=True)
+    
+    c_rev1 = sku_df[sku_df["Date"]==d1].groupby("City")["Offtake MRP"].sum()
+    c_rev2 = sku_df[sku_df["Date"]==d2].groupby("City")["Offtake MRP"].sum()
+    c_deltas = c_rev2.sub(c_rev1, fill_value=0).sort_values()
+    
+    # Competitor analysis
+    comp_insight = None
+    if category != "Unknown":
+        comp_df = df_all[(df_all["Category"] == category) & (df_all["Brand"] != "24 mantra organic")]
+        if not comp_df.empty:
+            c1 = comp_df[comp_df["Date"] == d1]
+            c2 = comp_df[comp_df["Date"] == d2]
+            if not c1.empty and not c2.empty:
+                comp_sov_d1 = c1["Ad SOV"].mean()
+                comp_sov_d2 = c2["Ad SOV"].mean()
+                comp_disc_d1 = c1["Wt. Discount %"].mean()
+                comp_disc_d2 = c2["Wt. Discount %"].mean()
+                
+                # Find aggressive competitor
+                b2 = c2.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
+                b1 = c1.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
+                b_diff = b2.sub(b1, fill_value=0)
+                agg_brand = None
+                if not b_diff.empty:
+                    top_sov = b_diff["SOV"].idxmax()
+                    top_sov_val = b_diff["SOV"].max()
+                    if top_sov_val > 1.0:
+                        agg_brand = f"{top_sov.title()} (+{top_sov_val:.1f}% SOV)"
+                        
+                comp_insight = {
+                    "sov_d1": round(comp_sov_d1, 1), "sov_d2": round(comp_sov_d2, 1),
+                    "disc_d1": round(comp_disc_d1, 1), "disc_d2": round(comp_disc_d2, 1),
+                    "aggressive_brand": agg_brand
+                }
+    
+    return {"sku_id": sku_id, "sku_name": sku_name, "rev_d1": round(s1["Revenue"], 0),
+            "rev_d2": round(s2["Revenue"], 0), "rev_delta": round(rev_delta, 0),
+            "attribution": attr, "worst_city": c_deltas.index[0] if len(c_deltas)>0 else "Unknown",
+            "worst_city_drop": round(c_deltas.iloc[0], 0) if len(c_deltas)>0 else 0,
+            "competitor_insight": comp_insight}
+
+
+# ── DATE COMPARISON ENGINE (Apr19 vs Apr20) ───────────────────────────────────
+def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
+    print(f"[COMPARE] {d1_str} vs {d2_str} deep-dive ...")
+    d1 = pd.Timestamp(d1_str)
+    d2 = pd.Timestamp(d2_str)
+
+    def day_agg(df, d):
+        s = df[df["Date"]==d]
+        if s.empty: return {}
+        return {"Revenue":float(s["Offtake MRP"].sum()),
+                "Units":float(s["Units"].sum()) if "Units" in s else None,
+                "OSA":float(s["Wt. OSA %"].mean()),
+                "Discount":float(s["Wt. Discount %"].mean()),
+                "Ad_SOV":float(s["Ad SOV"].mean()),
+                "Overall_SOV":float(s["Overall SOV"].mean()),
+                "Cat_Share":float(s["Category Share"].mean()),
+                "Darkstores":float(s["Darkstore_Count"].sum()),
+                "Network_Strength":float(s["Network_Strength"].sum()),
+                "SKUs_active":int(s["Product ID"].nunique()),
+                "Cities_active":int(s["City"].nunique())}
+
+    s1 = day_agg(df24, d1)
+    s2 = day_agg(df24, d2)
+    if not s1 or not s2:
+        return {"error": f"No data for {d1_str} or {d2_str}"}
+
+    # Delta for every metric
+    deltas = {}
+    for k in s1:
+        if s1[k] is not None and s2[k] is not None:
+            delta = s2[k]-s1[k]
+            pct   = delta/s1[k]*100 if s1[k]!=0 else 0
+            deltas[k] = {"d1":round(s1[k],2),"d2":round(s2[k],2),
+                         "delta":round(delta,2),"pct":round(pct,1)}
+
+    # City-level
+    city1 = df24[df24["Date"]==d1].groupby("City").agg(
+                Rev=("Offtake MRP","sum"),OSA=("Wt. OSA %","mean"),
+                Disc=("Wt. Discount %","mean"),SOV=("Ad SOV","mean"),
+                Dark=("Network_Strength","sum")).reset_index()
+    city2 = df24[df24["Date"]==d2].groupby("City").agg(
+                Rev=("Offtake MRP","sum"),OSA=("Wt. OSA %","mean"),
+                Disc=("Wt. Discount %","mean"),SOV=("Ad SOV","mean"),
+                Dark=("Network_Strength","sum")).reset_index()
+    city_merged = city1.merge(city2,on="City",suffixes=("_d1","_d2"),how="outer").fillna(0)
+    city_merged["Rev_Delta"]  = city_merged["Rev_d2"]-city_merged["Rev_d1"]
+    city_merged["OSA_Delta"]  = city_merged["OSA_d2"]-city_merged["OSA_d1"]
+    city_merged["Dark_Delta"] = city_merged["Dark_d2"]-city_merged["Dark_d1"]
+    city_merged["Rev_Pct"]    = city_merged.apply(
+        lambda r: r["Rev_Delta"]/r["Rev_d1"]*100 if r["Rev_d1"]!=0 else 0, axis=1)
+
+    city_detail = city_merged.sort_values("Rev_Delta")[
+        ["City","Rev_d1","Rev_d2","Rev_Delta","Rev_Pct","OSA_d2","OSA_Delta","Dark_d2","Dark_Delta"]
+    ].round(1).to_dict(orient="records")
+
+    # SKU-level top losers
+    sku1 = df24[df24["Date"]==d1].groupby(["Product ID","Product Name","Grammage"])["Offtake MRP"].sum().reset_index(name="Rev_d1")
+    sku2 = df24[df24["Date"]==d2].groupby(["Product ID","Product Name","Grammage"])["Offtake MRP"].sum().reset_index(name="Rev_d2")
+    sku  = sku1.merge(sku2,on=["Product ID","Product Name","Grammage"],how="outer").fillna(0)
+    sku["Delta"] = sku["Rev_d2"]-sku["Rev_d1"]
+    sku["Pct"]   = sku.apply(lambda r: r["Delta"]/r["Rev_d1"]*100 if r["Rev_d1"]!=0 else 0,axis=1)
+    top_sku_losers  = sku.nsmallest(10,"Delta")[["Product ID","Product Name","Grammage","Rev_d1","Rev_d2","Delta","Pct"]].round(1).to_dict(orient="records")
+    top_sku_gainers = sku.nlargest(10,"Delta")[["Product ID","Product Name","Grammage","Rev_d1","Rev_d2","Delta","Pct"]].round(1).to_dict(orient="records")
+
+    # Category competitive — same correct logic as L6
+    # Group by (City, Category) to avoid double-counting multiple SKUs in same category pool
+    def day_cat_rev(df24_day):
+        valid = df24_day[
+            df24_day["Offtake MRP"].notna() &
+            df24_day["Category Share"].notna() &
+            (df24_day["Category Share"] > 0)
+        ].copy()
+        # Category Share is already % (e.g. 6.46 = 6.46%)
+        valid["Implied_Cat_Rev"] = valid["Offtake MRP"] / (valid["Category Share"] / 100)
+        grp = valid.groupby(["City", "Category"]).agg(
+            brand_rev=("Offtake MRP", "sum"),
+            cat_rev=("Implied_Cat_Rev", "mean"),  # mean per group avoids double-count
+        ).reset_index()
+        total_brand = grp["brand_rev"].sum()
+        total_cat   = grp["cat_rev"].sum()
+        share_pct   = total_brand / total_cat * 100 if total_cat > 0 else 0
+        return float(total_cat), float(share_pct)
+
+    cat1_rev, share1_pct = day_cat_rev(df24[df24["Date"] == d1])
+    cat2_rev, share2_pct = day_cat_rev(df24[df24["Date"] == d2])
+    brand_share1 = share1_pct
+    brand_share2 = share2_pct
+    cat_change   = (cat2_rev - cat1_rev) / cat1_rev * 100 if cat1_rev > 0 else 0
+    brand_change = deltas.get("Revenue", {}).get("pct", 0)
+    share_chg    = round(brand_share2 - brand_share1, 2)
+
+
+    # Attribution: which drivers caused how much of the revenue delta
+    rev_delta = s2["Revenue"]-s1["Revenue"]
+    sens = {d:abs(lag.get(d,{}).get("best_r",0)) for d in ["OSA","Discount","Ad_SOV","Network_Strength"]}
+    tot  = sum(sens.values()) or 1
+    drv_attribution = []
+    for d,dcol in [("OSA","OSA"),("Discount","Discount"),("Ad_SOV","Ad_SOV"),("Network_Strength","Network_Strength")]:
+        dd  = (s2.get(dcol,0) or 0)-(s1.get(dcol,0) or 0)
+        w   = sens[d]/tot
+        imp = rev_delta*w*(1 if dd*rev_delta>=0 else -1)
+        lag_d = lag.get(d,{}).get("best_lag_days",0)
+        note  = f"lag={lag_d}d -- impact felt {'immediately' if lag_d==0 else f'{lag_d} day(s) after change'}"
+        hist_ev = find_historical_evidence(ts, d, dd, imp, d1_str, d2_str)
+        
+        driver_name = d
+        custom_narrative = None
+        if d == "Network_Strength":
+            dark_dd = (s2.get("Darkstores",0) or 0)-(s1.get("Darkstores",0) or 0)
+            net_delta = dd
+            base_val = s1.get(dcol,0) or 0
+            curr_val = s2.get(dcol,0) or 0
+            store_action = f"lost {abs(dark_dd):.0f}" if dark_dd < 0 else (f"gained {dark_dd:.0f}" if dark_dd > 0 else "saw no change in")
+            cap_action = f"wiped out {abs(net_delta):.1f}%" if net_delta < 0 else (f"added {net_delta:.1f}%" if net_delta > 0 else "didn't change")
+            imp_action = f"causing a drop of Rs. {abs(imp):,.0f}" if imp < 0 else f"driving a gain of Rs. {abs(imp):,.0f}"
+            custom_narrative = f"You {store_action} physical stores, which {cap_action} of your sales capacity ({base_val:.1f}% -> {curr_val:.1f}%), {imp_action}."
+            driver_name = "Network_Capacity"
+
+        drv_attribution.append({"driver":driver_name,"d1_value":round(s1.get(dcol,0),2),
+            "d2_value":round(s2.get(dcol,0),2),"delta":round(dd,2),
+            "revenue_impact_rs":round(imp,0),"share_pct":round(imp/rev_delta*100,1) if rev_delta!=0 else 0,
+            "lag_note":note, "historical_evidence": hist_ev, "custom_narrative": custom_narrative})
+    drv_attribution.sort(key=lambda x:abs(x["revenue_impact_rs"]),reverse=True)
+
+    dir_word = "DECLINE" if rev_delta < 0 else "GROWTH"
+    pct_word  = abs(round(brand_change, 1))
+    cat_word  = "fell" if cat_change < 0 else "rose"
+    if brand_change < 0 and cat_change < 0 and abs(cat_change) >= abs(brand_change) * 0.7:
+        verdict = "MARKET_ISSUE"
+    elif brand_change < 0 and abs(cat_change) < 2:
+        verdict = "OWN_ISSUE"   # brand fell, category flat
+    elif brand_change < cat_change:
+        verdict = "OWN_ISSUE"
+    else:
+        verdict = "OUTPERFORMING"
+    top_drv = drv_attribution[0] if drv_attribution else {}
+
+    narrative_lines = [
+        f"### === {BRAND_DISPLAY} | {d1_str} vs {d2_str} ===",
+        "",
+        f"**HEADLINE**: Revenue {dir_word} of {pct_word}% (Rs.{rev_delta:+,.0f})",
+        f"- {d1_str}: Rs.{s1['Revenue']:,.0f}  |  {d2_str}: Rs.{s2['Revenue']:,.0f}",
+        "",
+        f"**MARKET CONTEXT**:",
+        f"- Blinkit organic category revenue {cat_word} {abs(cat_change):.1f}% on same day.",
+        f"- {BRAND_DISPLAY} share: {brand_share1:.1f}% -> {brand_share2:.1f}% ({share_chg:+.1f} pts)",
+        f"- Verdict: **{verdict}**",
+        ("  => The overall category also declined. Market-level headwind."
+         if verdict == "MARKET_ISSUE"
+         else "  => Category was flat but brand fell -- OWN levers are the root cause."
+         if verdict == "OWN_ISSUE" and abs(cat_change) < 2
+         else "  => Brand underperformed the category -- own operational/marketing levers are the root cause."
+         if verdict == "OWN_ISSUE"
+         else "  => Brand grew faster than category -- maintain what is working."),
+        "",
+        "**DRIVER SNAPSHOT (d1 -> d2)**:",
+    ]
+    for k in ["OSA","Discount","Ad_SOV","Darkstores","SKUs_active","Cities_active"]:
+        if k in deltas:
+            d=deltas[k]
+            arrow = "v" if d["delta"]<0 else ("^" if d["delta"]>0 else "=")
+            narrative_lines.append(f"- **{k}**: {d['d1']} -> {d['d2']}  ({arrow} {d['pct']:+.1f}%)")
+    narrative_lines += [
+        "",
+        "**TOP FINANCIAL ATTRIBUTION (what caused the revenue move)**:",
+    ]
+    for a in drv_attribution:
+        sign = "+" if a["revenue_impact_rs"]>=0 else ""
+        if a.get("custom_narrative"):
+            narrative_lines.append(f"- **{a['driver']}**: {a['custom_narrative']}")
+        else:
+            narrative_lines.append(
+                f"- **{a['driver']}**: {sign}Rs.{a['revenue_impact_rs']:,.0f} ({a['share_pct']}% of delta)  {a['lag_note']}")
+        if a.get("historical_evidence"):
+            narrative_lines.append(f"  > *{a['historical_evidence']}*")
+    narrative_lines += [
+        "",
+        "**GEOGRAPHIC STORY (biggest city movers)**:",
+    ]
+    for row in sorted(city_detail, key=lambda x:x["Rev_Delta"])[:5]:
+        narrative_lines.append(
+            f"- **{row['City']}**: Rs.{row['Rev_Delta']:+.0f} | OSA={row['OSA_d2']:.1f}%"
+            f" (OSA chg {row['OSA_Delta']:+.1f}%) | Net_Strength={row['Dark_d2']:.0f} (chg {row['Dark_Delta']:+.0f})")
+    narrative_lines += ["", "**TOP LOSING SKUs**:", ""]
+    for s in top_sku_losers[:5]:
+        narrative_lines.append(
+            f"- {s['Product Name']} {s['Grammage']}: Rs.{s['Delta']:+.0f} ({s['Pct']:+.1f}%)")
+
+    sku_deep_dives = []
+    narrative_lines += ["", "### SKU DEEP DIVE (Top Losers with Historical Validation)"]
+    for s in top_sku_losers[:5]:
+        sd = sku_deep_dive(df24, df_all, s["Product ID"], f"{s['Product Name']} {s['Grammage']}", d1_str, d2_str)
+        if not sd: continue
+        sku_deep_dives.append(sd)
+        narrative_lines.append(f"#### {sd['sku_name']}")
+        narrative_lines.append(f"- **Revenue**: Rs.{sd['rev_d1']} -> Rs.{sd['rev_d2']} (Drop: Rs.{abs(sd['rev_delta']):.0f})")
+        narrative_lines.append(f"- **Worst City Drop**: {sd['worst_city']} (Rs.{abs(sd['worst_city_drop']):.0f})")
+        narrative_lines.append(f"- **Driver Attribution & Evidence**:")
+        for a in sd["attribution"][:3]:
+            if a.get("custom_narrative"):
+                narrative_lines.append(f"  - **{a['driver']}**: {a['custom_narrative']}")
+            else:
+                narrative_lines.append(f"  - **{a['driver']}**: {a['d1_val']} -> {a['d2_val']} | Impact: Rs.{a['impact_rs']:.0f}")
+            if a["historical_evidence"]:
+                narrative_lines.append(f"    > *{a['historical_evidence']}*")
+        
+        ci = sd.get("competitor_insight")
+        if ci:
+            narrative_lines.append(f"- **Competitive Pressure (Category-Level)**:")
+            narrative_lines.append(f"  - Competitor Ad SOV: {ci['sov_d1']}% -> {ci['sov_d2']}%")
+            narrative_lines.append(f"  - Competitor Discount: {ci['disc_d1']}% -> {ci['disc_d2']}%")
+            if ci['aggressive_brand']:
+                narrative_lines.append(f"  - **Aggressive Mover**: {ci['aggressive_brand']}")
+
+    return {
+        "comparison_dates": {"d1":d1_str,"d2":d2_str},
+        "headline_delta_rs": round(rev_delta,0),
+        "headline_pct":      round(brand_change,1),
+        "market_verdict":    verdict,
+        "day_summaries":     {"d1":s1,"d2":s2},
+        "metric_deltas":     deltas,
+        "driver_attribution":drv_attribution,
+        "city_detail":       city_detail,
+        "top_sku_losers":    top_sku_losers,
+        "top_sku_gainers":   top_sku_gainers,
+        "sku_deep_dives":    sku_deep_dives,
+        "narrative":         "\n".join(narrative_lines),
+        "category_context":  {"cat_revenue_d1":round(float(cat1_rev),0),"cat_revenue_d2":round(float(cat2_rev),0),
+                               "cat_change_pct":round(cat_change,2),
+                               "brand_share_d1":round(brand_share1,2),"brand_share_d2":round(brand_share2,2),
+                               "share_point_change":round(share_chg,2)},
+    }
+
+
+# ── LLM BRIEF GENERATOR ───────────────────────────────────────────────────────
+def generate_brief(report, outdir):
+    sep  = "=" * 70
+    L    = []
+    comp = report.get("COMPARISON", {})
+    l0   = report.get("L0_raw_snapshot", {})
+    l1   = report.get("L1_baseline", {})
+    l4   = report.get("L4_lag", {})
+    l3   = report.get("L3_thresholds", {})
+    l2   = report.get("L2_interactions", {})
+    l5   = report.get("L5_pullforward", {})
+    l6   = report.get("L6_competitive", {})
+    l7   = report.get("L7_geographic", {})
+    l8   = report.get("L8_leading", {})
+    l9   = report.get("L9_attribution", {})
+    l10  = report.get("L10_feedback", {})
+
+    L += [f"# ADVANCED SALES RCA -- {BRAND_DISPLAY} (Blinkit) - FINAL EXECUTIVE SUMMARY",
+          f"**Generated** : {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+          f"**Period**    : {report['meta']['date_range']}  ({report['meta']['total_days']} days)",
+          "---", ""]
+
+    # L0 Raw Snapshot (Evidence First)
+    if l0:
+        L += ["## L0 -- RAW DAILY SNAPSHOT (Evidence Base)",
+              "| Date | DOW | Revenue | OSA | Network Strength | Ad SOV | Discount |",
+              "|---|---|---|---|---|---|---|"]
+        for r in l0.get("last_n_days", []):
+            rev_str = f"Rs.{r['revenue_rs']:,.0f} ({r['revenue_L']})"
+            L.append(f"| {r['date']} | {r['dow']} | {rev_str} | {str(r['OSA'])} | {str(r.get('Network_Strength', r.get('Darkstores')))} | {str(r['Ad_SOV'])} | {str(r['Discount'])} |")
+        L.append("")
+
+    # Comparison
+    if comp and "narrative" in comp:
+        L += [f"## PRIMARY COMPARISON: {comp['comparison_dates']['d1']} vs {comp['comparison_dates']['d2']}", ""]
+        L.append(comp["narrative"])
+        L.append("")
+
+    # L4
+    L.append("## L4 -- LAG ANALYSIS (Cause & Effect Timing)")
+    for d, info in l4.items():
+        sig = "significant" if info.get("significant") else "NOT significant"
+        L.append(f"- **{d}**: lag={info.get('best_lag_days')}d | r={info.get('best_r')} [{sig}] {info.get('direction')}")
+        if info.get("lag_validation"):
+            for ex in info["lag_validation"]:
+                L.append(f"  - *{ex}*")
+    L.append("")
+
+    # L3
+    L.append("## L3 -- THRESHOLD ZONES")
+    for d, info in l3.items():
+        zone = f"[{info.get('current_zone','')}]"
+        L.append(f"- **{d}**: {info.get('current')} {zone} (STATUS=**{info.get('status')}**)")
+        if info.get("status") in ("CRITICAL", "WARNING"):
+            L.append(f"  - ⚠️ Sales penalty at breach: {info.get('sales_penalty_pct')}%")
+        if info.get("zone_bands"):
+            for lo, hi, zname, zdesc in info["zone_bands"]:
+                L.append(f"  - {zdesc}")
+        if info.get("last_3_days"):
+            trend_str = " | ".join([f"{t['date']}={t['value']}" for t in info["last_3_days"]])
+            L.append(f"  - Trend: {trend_str}")
+    L.append("")
+
+    # L2
+    L.append("## L2 -- DRIVER INTERACTIONS")
+    for w in l2.get("warnings",[]): L.append(f"- 🔴 {w}")
+    for p in l2.get("positives",[]): L.append(f"- 🟢 {p}")
+    if not l2.get("warnings") and not l2.get("positives"): L.append("- No critical interactions.")
+    L.append("")
+
+    # L1
+    L += ["## L1 -- SMART BASELINE",
+          f"- **Trend slope**: Rs.{l1.get('trend_slope_day','N/A')}/day",
+          f"- **Trend R2**: {l1.get('trend_r2','N/A')}",
+          f"- **True anomaly dates**: {l1.get('true_anomaly_dates',[])}", ""]
+
+    # L6
+    L += ["## L6 -- MARKET vs OWN FACTOR",
+          f"- **Verdict**: **{l6.get('latest_verdict','N/A')}**",
+          f"- {l6.get('latest_explanation','')}",
+          f"- Brand DoD: {l6.get('brand_dod')}% | Category DoD: {l6.get('cat_dod')}%", ""]
+
+    # L7
+    L += ["## L7 -- GEOGRAPHIC CASCADE",
+          f"- **National change**: Rs.{l7.get('total_national_change',0):,.0f}",
+          f"- **Pattern**: {l7.get('drop_pattern')} -- {l7.get('drop_pattern_note','')}",
+          "", "### Top losing cities:"]
+    for c in l7.get("top_losing_cities",[]): L.append(f"- **{c['City']}** ({c['Tier']}): Rs.{c['Change']:+.0f} | OSA={c['OSA']:.1f}% | Net_Strength={c['Network_Strength']:.1f}")
+    L.append("")
+
+    # L8
+    L.append("## L8 -- LEADING INDICATOR ALERTS")
+    if not l8.get("alerts"): L.append("- ✅ No deteriorating trends.")
+    for a in l8.get("alerts",[]):
+        L += [f"- **[{a['severity']}]** {a['alert']}",
+              f"  - Trend: {a.get('daily_trend')} (net {a.get('net_change'):+.2f})",
+              f"  - => *{a['prediction']}*"]
+    L.append("")
+
+    # L9
+    L += ["## L9 -- FINANCIAL ATTRIBUTION",
+          f"- {l9.get('baseline_date')} -> {l9.get('analysis_date')}",
+          f"- **Total Rev Delta**: Rs.{l9.get('total_delta_rs',0):,.0f}"]
+    for d in l9.get("driver_attributions",[]):
+        s = "+" if d["revenue_impact_rs"]>=0 else ""
+        if d.get("custom_narrative"):
+             L.append(f"- **{d['driver']}**: {d['custom_narrative']} | lag={d['lag_days']}d")
+        else:
+             L.append(f"- **{d['driver']}**: {s}Rs.{d['revenue_impact_rs']:,.0f} ({d['share_pct']}%) | lag={d['lag_days']}d")
+        if d.get("historical_evidence"):
+            L.append(f"  > *{d['historical_evidence']}*")
+    L.append("")
+
+    # L10
+    L += ["## L10 -- CONFIDENCE & FEEDBACK",
+          f"- **Score**  : {l10.get('confidence_score')}%",
+          f"- **Level**  : {l10.get('interpretation')}",
+          f"- **Guardrail**: *{l10.get('guardrail_message')}*"]
+    if l10.get("reasons_for_score"):
+        L.append("- **Reasons**:")
+        for r in l10["reasons_for_score"]: L.append(f"  - {r}")
+    if l10.get("recommended_actions"):
+        L.append("- **Actions**:")
+        for a in l10["recommended_actions"]: L.append(f"  - {a}")
+    L += [f"- **Override**: {l10.get('override_instructions','')}", "",
+          "---", "**END OF FINAL EXECUTIVE SUMMARY**", "---"]
+
+    text = "\n".join(L)
+    path = outdir / "advanced_rca_executive_summary.md"
+    path.write_text(text, encoding="utf-8")
+    return text, path
+
+
+# ── MAIN ORCHESTRATOR ─────────────────────────────────────────────────────────
+def main():
+    out = make_output_dir()
+    print(f"\n[OUTPUT] Folder: {out}\n")
+
+    df1, df24, df_all = load_data()
+    ts = build_ts(df24)
+    print(f"\nDate range: {ts['Date'].min().date()} to {ts['Date'].max().date()}  | {len(ts)} days\n")
+
+    l0       = L0_raw_snapshot(ts)
+    l1, ts   = L1_baseline(ts)
+    l4       = L4_lag(ts)
+    l3       = L3_thresholds(ts, l4)
+    l2       = L2_interactions(ts)
+    l5       = L5_pullforward(ts)
+    l6       = L6_competitive(df24, df_all)
+    l7       = L7_geographic(df24, l6.get("latest_verdict", ""))
+    l8       = L8_leading(ts, df24)
+    l9       = L9_attribution(ts, l4)
+    l10      = L10_feedback(l1, l9, l4, len(ts))
+    comp     = compare_two_days(df24, df_all, ts, COMPARE_DATE1, COMPARE_DATE2, l4)
+
+    report = {
+        "meta": {"brand":BRAND_DISPLAY,"generated_at":datetime.now().isoformat(),
+                 "date_range":f"{ts['Date'].min().date()} to {ts['Date'].max().date()}",
+                 "total_days":len(ts)},
+        "L0_raw_snapshot":l0,
+        "L1_baseline":l1,"L2_interactions":l2,"L3_thresholds":l3,"L4_lag":l4,
+        "L5_pullforward":l5,"L6_competitive":l6,"L7_geographic":l7,
+        "L8_leading":l8,"L9_attribution":l9,"L10_feedback":l10,
+        "COMPARISON":comp,
+    }
+
+    json_path = out / "advanced_rca_report.json"
+    with open(json_path,"w",encoding="utf-8") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"\n[OK] JSON report  -> {json_path}")
+
+    _, brief_path = generate_brief(report, out)
+    print(f"[OK] Executive Summary -> {brief_path}")
+
+    # Print the comparison narrative directly to console
+    print("\n" + "="*70)
+    print(comp.get("narrative","No comparison generated."))
+    print("="*70)
+    print(f"\nConfidence: {l10['confidence_score']}%  |  Verdict: {l6['latest_verdict']}")
+    print(f"Drop pattern: {l7['drop_pattern']}  |  Top driver: {l9.get('top_driver')}")
+    print(f"Leading alerts: {l8['total_alerts']}")
+    print(f"\n[OUTPUT FOLDER] {out}")
+
+
+if __name__ == "__main__":
+    main()
