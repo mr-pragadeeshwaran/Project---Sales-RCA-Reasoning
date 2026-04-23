@@ -774,7 +774,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
     import numpy as np
     from scipy import stats
-    from sklearn.linear_model import Ridge
+    from sklearn.linear_model import LinearRegression
     import warnings
     
     # Pre-scan univariate
@@ -797,13 +797,25 @@ def _fit_sku_city_regression_dynamic(history_df):
             
     scored.sort(key=lambda x: -x["r2"])
     
-    # Select best non-redundant (max 7 variables for 20 days of data)
+    # Select best non-redundant (max 5 variables for 20 days of data)
     selected = []
     for s in scored:
         if s["p"] < 0.20:
-            # simple collinearity check could go here, for now just pick top
-            selected.append(s)
-            if len(selected) >= 7: break
+            is_redundant = False
+            for sel in selected:
+                sh1 = history_df[s["feat"]].shift(s["lag"])
+                sh2 = history_df[sel["feat"]].shift(sel["lag"])
+                mask = sh1.notna() & sh2.notna()
+                if mask.sum() > 5:
+                    try:
+                        r_val, _ = stats.pearsonr(sh1[mask], sh2[mask])
+                        if abs(r_val) > 0.80:
+                            is_redundant = True
+                            break
+                    except: pass
+            if not is_redundant:
+                selected.append(s)
+            if len(selected) >= 5: break
             
     if not selected:
         return {}, []
@@ -823,7 +835,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     if n >= p_len + 2:
         X = ols_df[drivers].values
         y = ols_df["Revenue"].values
-        reg = Ridge(alpha=10.0).fit(X, y)
+        reg = LinearRegression().fit(X, y)
         coefs = reg.coef_
         r2_model = reg.score(X, y)
         for i, s in enumerate(selected):
@@ -851,7 +863,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
     import numpy as np
     from scipy import stats
-    from sklearn.linear_model import Ridge
+    from sklearn.linear_model import LinearRegression
     import warnings
     
     # Pre-scan univariate
@@ -874,12 +886,25 @@ def _fit_sku_city_regression_dynamic(history_df):
             
     scored.sort(key=lambda x: -x["r2"])
     
-    # Select best non-redundant (max 7 variables for 20 days of data)
+    # Select best non-redundant (max 5 variables for 20 days of data)
     selected = []
     for s in scored:
         if s["p"] < 0.20:
-            selected.append(s)
-            if len(selected) >= 7: break
+            is_redundant = False
+            for sel in selected:
+                sh1 = history_df[s["feat"]].shift(s["lag"])
+                sh2 = history_df[sel["feat"]].shift(sel["lag"])
+                mask = sh1.notna() & sh2.notna()
+                if mask.sum() > 5:
+                    try:
+                        r_val, _ = stats.pearsonr(sh1[mask], sh2[mask])
+                        if abs(r_val) > 0.80:
+                            is_redundant = True
+                            break
+                    except: pass
+            if not is_redundant:
+                selected.append(s)
+            if len(selected) >= 5: break
             
     if not selected:
         return {}, []
@@ -899,7 +924,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     if n >= p_len + 2:
         X = ols_df[drivers].values
         y = ols_df["Revenue"].values
-        reg = Ridge(alpha=10.0).fit(X, y)
+        reg = LinearRegression().fit(X, y)
         coefs = reg.coef_
         r2_model = reg.score(X, y)
         for i, s in enumerate(selected):
