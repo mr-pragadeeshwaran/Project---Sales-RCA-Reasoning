@@ -15,8 +15,8 @@ from sklearn.linear_model import LinearRegression
 warnings.filterwarnings("ignore")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-FILE1  = r"D:\2. Area\24 Mantra\April-26\Sales RCA\blinkit-availability-data-april26-day wise.csv"
-FILE2  = r"D:\2. Area\24 Mantra\April-26\Sales RCA\blinkit-rca-download-April-26-Daily-City-Comp.csv"
+DIR_AVAILABILITY = r"C:\Users\cpsge\.gemini\antigravity\scratch\Project - Sales RCA Reasoning\Input\Availability"
+DIR_RCA = r"C:\Users\cpsge\.gemini\antigravity\scratch\Project - Sales RCA Reasoning\Input\RCA"
 OUTDIR = r"c:\Users\cpsge\.gemini\antigravity\scratch\Project - Sales RCA Reasoning\output"
 
 BRAND_RAW    = "24 mantra organic"        # as stored in data (lowercase)
@@ -52,29 +52,89 @@ def make_output_dir() -> Path:
 
 # ── DATA LOADING ──────────────────────────────────────────────────────────────
 def load_data():
-    print("[LOAD] Reading File 1 (availability) ...")
+    import glob
+    import gc
+    import pandas as pd
+    import os
+    
+    print("[LOAD] Reading Availability files ...")
     c1 = ["Date","Store ID","Product ID","Brand","Item ID","Title","Grammage",
           "BGR","Locality City","Locality","Listing %","Avg. OSA %","MRP","SP",
           "Wt. Disc %","SKU Stock Levels","Locality Sales Contribution","Product_type"]
-    df1 = pd.read_csv(FILE1, usecols=c1, parse_dates=["Date"], low_memory=False)
-    df1["Brand"] = df1["Brand"].str.lower().str.strip()
-    df1 = df1[df1["Brand"] == BRAND_RAW].copy()
-    df1["Locality City"] = df1["Locality City"].str.lower().str.strip()
+          
+    df1_list = []
+    avail_files = glob.glob(os.path.join(DIR_AVAILABILITY, "*.csv"))
+    if not avail_files:
+        raise FileNotFoundError(f"No CSV files found in {DIR_AVAILABILITY}")
+        
+    for f in avail_files:
+        print(f"       -> Loading {os.path.basename(f)}")
+        temp_df = pd.read_csv(f, usecols=c1, parse_dates=["Date"], low_memory=False)
+        temp_df["Brand"] = temp_df["Brand"].astype(str).str.lower().str.strip()
+        temp_df = temp_df[temp_df["Brand"] == BRAND_RAW]
+        temp_df["Locality City"] = temp_df["Locality City"].astype(str).str.lower().str.strip()
+        df1_list.append(temp_df)
+        del temp_df
+        gc.collect()
+        
+    df1 = pd.concat(df1_list, ignore_index=True)
+    del df1_list
+    gc.collect()
 
-    print("[LOAD] Reading File 2 (RCA metrics) ...")
-    c2 = ["Date","Product ID","Item ID","Product Name","Grammage","Category","City","Brand",
-          "Offtake MRP","Offtake SP","SP","MRP","Units","Wt. OSA %","Wt. Discount %",
-          "Category Share","Est. Category Share SP","Overall SOV","Organic SOV","Ad SOV",
-          "Wt. PPU (x100)","Product_type"]
-    df_all = pd.read_csv(FILE2, usecols=c2, parse_dates=["Date"], low_memory=False)
-    df_all["Brand"] = df_all["Brand"].str.lower().str.strip()
+    print("[LOAD] Reading RCA files ...")
+    
+    # Map for RCA new headers -> expected headers
+    rca_col_map = {
+        "Product Title": "Product Name",
+        "Offtake (MRP)": "Offtake MRP",
+        "Offtake (SP)": "Offtake SP",
+        "Selling Price": "SP",
+        "Offtake (Qty)": "Units",
+        "Est. Category Share": "Category Share",
+        "Est. Category Share (SP)": "Est. Category Share SP",
+        "Wt. PPU": "Wt. PPU (x100)"
+    }
+    
+    df_all_list = []
+    rca_files = glob.glob(os.path.join(DIR_RCA, "*.csv"))
+    if not rca_files:
+        raise FileNotFoundError(f"No CSV files found in {DIR_RCA}")
+        
+    for f in rca_files:
+        print(f"       -> Loading {os.path.basename(f)}")
+        # Read a tiny piece first to get columns
+        cols_in_file = pd.read_csv(f, nrows=0).columns.tolist()
+        
+        # Decide which columns to read based on what's available
+        use_cols = []
+        c2_expected = ["Date","Product ID","Item ID","Product Name","Grammage","Category","City","Brand",
+                      "Offtake MRP","Offtake SP","SP","MRP","Units","Wt. OSA %","Wt. Discount %",
+                      "Category Share","Est. Category Share SP","Overall SOV","Organic SOV","Ad SOV",
+                      "Wt. PPU (x100)","Product_type"]
+                      
+        # Reverse map to figure out what to read
+        reverse_map = {v: k for k, v in rca_col_map.items()}
+        for exp_c in c2_expected:
+            if exp_c in cols_in_file:
+                use_cols.append(exp_c)
+            elif exp_c in reverse_map and reverse_map[exp_c] in cols_in_file:
+                use_cols.append(reverse_map[exp_c])
+                
+        temp_df = pd.read_csv(f, usecols=use_cols, parse_dates=["Date"], low_memory=False)
+        temp_df.rename(columns=rca_col_map, inplace=True)
+        temp_df["Brand"] = temp_df["Brand"].astype(str).str.lower().str.strip()
+        df_all_list.append(temp_df)
+        
+    df_all = pd.concat(df_all_list, ignore_index=True)
+    del df_all_list
+    gc.collect()
 
     active_stores = df1[df1["Avg. OSA %"] == 100.0].copy()
     active_stores["Is_High_Value"] = (active_stores["Locality Sales Contribution"] >= 0.00168).astype(int)
     
     # Fix City mapping for Delhi-NCR
     ncr_cities = ["delhi", "new delhi", "noida", "gurgaon", "gurugram", "faridabad", "ghaziabad"]
-    active_stores["city_key"] = active_stores["Locality City"].str.lower().str.strip()
+    active_stores["city_key"] = active_stores["Locality City"]
     active_stores["city_key"] = active_stores["city_key"].apply(lambda c: "delhi-ncr" if c in ncr_cities else c)
     
     dark = active_stores.groupby(["Date","city_key","Product ID"]).agg(
@@ -84,7 +144,7 @@ def load_data():
     ).reset_index()
     dark["Network_Strength"] = dark["Network_Strength"] * 100
 
-    df_all["city_key"] = df_all["City"].str.lower().str.strip()
+    df_all["city_key"] = df_all["City"].astype(str).str.lower().str.strip()
     df_all = df_all.merge(dark, left_on=["Date","city_key","Product ID"],
                           right_on=["Date","city_key","Product ID"], how="left")
     df_all["Darkstore_Count"] = df_all["Darkstore_Count"].fillna(0)
@@ -92,6 +152,13 @@ def load_data():
     df_all["High_Value_Darkstores"] = df_all["High_Value_Darkstores"].fillna(0)
 
     df24 = df_all[df_all["Brand"] == BRAND_RAW].copy()
+    
+    # Check if dates span >20 days
+    date_min = df24["Date"].min()
+    date_max = df24["Date"].max()
+    days_span = (date_max - date_min).days + 1
+    print(f"\\nDate range: {date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}  | {days_span} days")
+    
     print(f"    File1 rows: {len(df1):,}  |  File2 (24M): {len(df24):,}  |  All brands: {len(df_all):,}")
     return df1, df24, df_all, active_stores
 
@@ -707,7 +774,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
     import numpy as np
     from scipy import stats
-    from sklearn.linear_model import LinearRegression
+    from sklearn.linear_model import Ridge
     import warnings
     
     # Pre-scan univariate
@@ -756,7 +823,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     if n >= p_len + 2:
         X = ols_df[drivers].values
         y = ols_df["Revenue"].values
-        reg = LinearRegression().fit(X, y)
+        reg = Ridge(alpha=10.0).fit(X, y)
         coefs = reg.coef_
         r2_model = reg.score(X, y)
         for i, s in enumerate(selected):
@@ -784,7 +851,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
     import numpy as np
     from scipy import stats
-    from sklearn.linear_model import LinearRegression
+    from sklearn.linear_model import Ridge
     import warnings
     
     # Pre-scan univariate
@@ -832,7 +899,7 @@ def _fit_sku_city_regression_dynamic(history_df):
     if n >= p_len + 2:
         X = ols_df[drivers].values
         y = ols_df["Revenue"].values
-        reg = LinearRegression().fit(X, y)
+        reg = Ridge(alpha=10.0).fit(X, y)
         coefs = reg.coef_
         r2_model = reg.score(X, y)
         for i, s in enumerate(selected):
@@ -999,6 +1066,9 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
                 agg_impacts[agg_key] = {"impact": 0, "feat": feat}
             agg_impacts[agg_key]["impact"] += impact
             
+            if total_drop < 0 and impact > 0: continue
+            if total_drop > 0 and impact < 0: continue
+            
             if "SOV" in feat or "Discount" in feat or "OSA" in feat or "Listing" in feat:
                 delta_str = f"{delta:+.1f}%"
                 v1_str, v2_str = f"{v1:.1f}%", f"{v2:.1f}%"
@@ -1020,9 +1090,10 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
             agg_impacts["Market Fluctuation (Unexplained)"] = {"impact": 0, "feat": "Market Fluctuation"}
         agg_impacts["Market Fluctuation (Unexplained)"]["impact"] += unexplained
         
-        unexplained_str = f"**Rs.{unexplained:+,.0f}**" if unexplained < 0 else f"*Rs.{unexplained:+,.0f}*"
-        row_str = f"| **Unexplained** | Market Fluctuation | - | - | - | {unexplained_str} | Natural platform variance / noise. |"
-        city_rows.append(row_str)
+        if not (total_drop < 0 and unexplained > 0) and not (total_drop > 0 and unexplained < 0):
+            unexplained_str = f"**Rs.{unexplained:+,.0f}**" if unexplained < 0 else f"*Rs.{unexplained:+,.0f}*"
+            row_str = f"| **Unexplained** | Market Fluctuation | - | - | - | {unexplained_str} | Natural platform variance / noise. |"
+            city_rows.append(row_str)
         
         city_results.append({
             "city": city,
@@ -1063,6 +1134,9 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
     for name, data in sorted_agg:
         imp = data["impact"]
         if abs(imp) < 100: continue
+        if total_drop < 0 and imp > 0: continue
+        if total_drop > 0 and imp < 0: continue
+        
         feat = data["feat"]
         
         insight = ""
@@ -1099,7 +1173,8 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
     return {"sku_name": sku_name, "rev_d1": total_rev_d1, "rev_d2": total_rev_d2, 
             "rev_delta": total_drop, "worst_city": c_deltas.index[0] if len(c_deltas)>0 else "Unknown",
             "worst_city_drop": c_deltas.iloc[0] if len(c_deltas)>0 else 0,
-            "markdown_table": "\\n".join(markdown_lines)}
+            "markdown_table": "
+".join(markdown_lines)}
 
 
 # ── DATE COMPARISON ENGINE (Apr19 vs Apr20) ───────────────────────────────────
