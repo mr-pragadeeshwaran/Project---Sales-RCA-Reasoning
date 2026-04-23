@@ -883,13 +883,13 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
     if not dropping_cities and len(c_deltas) > 0:
         dropping_cities = [c_deltas.index[0]]
         
-    markdown_lines = []
-    markdown_lines.append(f"#### 📦 {sku_name}")
-    markdown_lines.append(f"**Total Revenue:** Rs.{total_rev_d1:,.0f} -> Rs.{total_rev_d2:,.0f} (Drop: **Rs.{total_drop:+,.0f}**)")
-    markdown_lines.append("")
-    
     city_col_f1 = "Locality City" if "Locality City" in df1_sku.columns else "City" if "City" in df1_sku.columns else None
     
+    city_results = []
+    agg_impacts = {}
+    total_modeled_drop = 0
+    
+    # PASS 1: Calculate all models and store results
     for city in dropping_cities[:4]:  # Top 4 dropping cities
         cd_f2 = sku_df[sku_df["City"] == city].copy()
         city_prefix = city.split('-')[0][:6].lower()
@@ -952,15 +952,10 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
         if s1r.empty or s2r.empty: continue
         s1, s2 = s1r.iloc[0], s2r.iloc[0]
         city_drop = s2["Revenue"] - s1["Revenue"]
+        total_modeled_drop += city_drop
         
         sens, selected = _fit_sku_city_regression_dynamic(ts)
         r2_model = sens[selected[0]["feat"]]["r2"] if selected and selected[0]["feat"] in sens else 0.0
-        
-        markdown_lines.append(f"#### 🏙️ CITY: {city} | Drop: Rs.{city_drop:+,.0f}")
-        markdown_lines.append(f"**City Model Accuracy (R²):** {r2_model:.2f} | **Signals Tested:** {len(ts.columns)-3}")
-        markdown_lines.append("")
-        markdown_lines.append("| Driver Category | Metric | Apr 19 | Apr 20 | Delta | Impact | Insight |")
-        markdown_lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         
         # Categorize
         cat_map = {
@@ -973,6 +968,7 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
         }
         
         total_explained = 0
+        city_rows = []
         for s in selected:
             feat = s["feat"]
             if feat not in sens: continue
@@ -995,8 +991,13 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
             total_explained += impact
             
             category_str = cat_map.get(feat, "Other")
-            if lag > 0: feat_display = f"{feat} (Lag {lag}d)"
-            else: feat_display = feat
+            feat_display = f"{feat} (Lag {lag}d)" if lag > 0 else feat
+            
+            # Aggregate for overall table
+            agg_key = feat_display
+            if agg_key not in agg_impacts:
+                agg_impacts[agg_key] = {"impact": 0, "feat": feat}
+            agg_impacts[agg_key]["impact"] += impact
             
             if "SOV" in feat or "Discount" in feat or "OSA" in feat or "Listing" in feat:
                 delta_str = f"{delta:+.1f}%"
@@ -1011,17 +1012,94 @@ def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
             if feat == "Comp_Squeeze": insight = "Dual pressure of low OSA and competitor discount."
             
             impact_str = f"**Rs.{impact:+,.0f}**" if impact < 0 else f"*Rs.{impact:+,.0f}*"
-            markdown_lines.append(f"| **{category_str}** | {feat_display} | {v1_str} | {v2_str} | **{delta_str}** | {impact_str} | {insight} |")
+            row_str = f"| **{category_str}** | {feat_display} | {v1_str} | {v2_str} | **{delta_str}** | {impact_str} | {insight} |"
+            city_rows.append(row_str)
             
         unexplained = city_drop - total_explained
+        if "Market Fluctuation (Unexplained)" not in agg_impacts:
+            agg_impacts["Market Fluctuation (Unexplained)"] = {"impact": 0, "feat": "Market Fluctuation"}
+        agg_impacts["Market Fluctuation (Unexplained)"]["impact"] += unexplained
+        
         unexplained_str = f"**Rs.{unexplained:+,.0f}**" if unexplained < 0 else f"*Rs.{unexplained:+,.0f}*"
-        markdown_lines.append(f"| **Unexplained** | Market Fluctuation | - | - | - | {unexplained_str} | Natural platform variance / noise. |")
+        row_str = f"| **Unexplained** | Market Fluctuation | - | - | - | {unexplained_str} | Natural platform variance / noise. |"
+        city_rows.append(row_str)
+        
+        city_results.append({
+            "city": city,
+            "drop": city_drop,
+            "r2": r2_model,
+            "signals": len(ts.columns)-3,
+            "rows": city_rows
+        })
+        
+    # PASS 2: Build the Markdown Output
+    markdown_lines = []
+    markdown_lines.append(f"#### 📦 {sku_name}")
+    markdown_lines.append(f"**Total Revenue:** Rs.{total_rev_d1:,.0f} -> Rs.{total_rev_d2:,.0f} (Drop: **Rs.{total_drop:+,.0f}**)")
+    markdown_lines.append("")
+    
+    # Build City Drop Summary Table
+    markdown_lines.append("**1. City Drop Summary**")
+    markdown_lines.append("")
+    markdown_lines.append("| City | Revenue Drop (Rs.) |")
+    markdown_lines.append("| :--- | :--- |")
+    for cr in city_results:
+        drop_str = f"**Rs.{cr['drop']:,.0f}**" if cr['drop'] < 0 else f"*Rs.{cr['drop']:,.0f}*"
+        markdown_lines.append(f"| **{cr['city']}** | {drop_str} |")
+        
+    unmodeled = total_drop - total_modeled_drop
+    unmodeled_str = f"*Rs.{unmodeled:,.0f}*"
+    markdown_lines.append(f"| *Unmodeled Smaller Cities* | {unmodeled_str} |")
+    markdown_lines.append(f"| **Total SKU Drop** | **Rs.{total_drop:,.0f}** |")
+    markdown_lines.append("")
+    
+    # Build Aggregated Driver Impact Table
+    markdown_lines.append("**2. Aggregated Driver Impact (Across Modeled Cities)**")
+    markdown_lines.append("")
+    markdown_lines.append("| Metric / Driver | Total Rs. Impact | Insight |")
+    markdown_lines.append("| :--- | :--- | :--- |")
+    
+    sorted_agg = sorted(agg_impacts.items(), key=lambda x: x[1]["impact"])
+    for name, data in sorted_agg:
+        imp = data["impact"]
+        if abs(imp) < 100: continue
+        feat = data["feat"]
+        
+        insight = ""
+        if "Market Fluctuation" in name: insight = "Natural platform variance / noise."
+        elif "Is_Monday" in name: insight = "Natural day-of-week drop."
+        elif "Ad_SOV" in name: insight = "Ad spend visibility impact."
+        elif "Organic_SOV" in name: insight = "Organic search ranking impact."
+        elif "Discount" in name and "Comp" not in name: insight = "Direct impact of own discount."
+        elif "Comp_Discount" in name: insight = "Competitor pricing changes."
+        elif "Comp_Disc_Adv" in name: insight = "Relative pricing gap vs competitors."
+        elif "OSA" in name and "Comp" not in name: insight = "Own stock availability issues."
+        elif "Comp_OSA" in name: insight = "Competitor availability changes."
+        elif "Stock" in name: insight = "Impact of total SKU inventory in darkstores."
+        elif "Listing" in name: insight = "Store assortment/listing gap."
+        elif "Squeeze" in name: insight = "Dual pressure from low OSA and competitor discount."
+        
+        imp_str = f"**Rs.{imp:+,.0f}**" if imp < 0 else f"*Rs.{imp:+,.0f}*"
+        markdown_lines.append(f"| **{name}** | {imp_str} | {insight} |")
+        
+    markdown_lines.append("")
+    markdown_lines.append("---")
+    markdown_lines.append("")
+    
+    # Append individual city tables
+    for cr in city_results:
+        markdown_lines.append(f"#### 🏙️ CITY: {cr['city']} | Drop: Rs.{cr['drop']:+,.0f}")
+        markdown_lines.append(f"**City Model Accuracy (R²):** {cr['r2']:.2f} | **Signals Tested:** {cr['signals']}")
+        markdown_lines.append("")
+        markdown_lines.append("| Driver Category | Metric | Apr 19 | Apr 20 | Delta | Impact | Insight |")
+        markdown_lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        markdown_lines.extend(cr['rows'])
         markdown_lines.append("")
         
     return {"sku_name": sku_name, "rev_d1": total_rev_d1, "rev_d2": total_rev_d2, 
             "rev_delta": total_drop, "worst_city": c_deltas.index[0] if len(c_deltas)>0 else "Unknown",
             "worst_city_drop": c_deltas.iloc[0] if len(c_deltas)>0 else 0,
-            "markdown_table": "\n".join(markdown_lines)}
+            "markdown_table": "\\n".join(markdown_lines)}
 
 
 # ── DATE COMPARISON ENGINE (Apr19 vs Apr20) ───────────────────────────────────
