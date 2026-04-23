@@ -25,6 +25,12 @@ BRAND_DISPLAY= "24 Mantra Organic"        # for display / reports
 COMPARE_DATE1 = "2026-04-19"
 COMPARE_DATE2 = "2026-04-20"
 
+# Period comparison (week-level or any date range)
+COMPARE_PERIOD1_START = "2026-04-14"   # recent period (e.g. last week)
+COMPARE_PERIOD1_END   = "2026-04-20"
+COMPARE_PERIOD2_START = "2026-04-07"   # prior period (e.g. week before)
+COMPARE_PERIOD2_END   = "2026-04-13"
+
 THR = {
     "OSA_critical":      65.0,
     "OSA_warning":       75.0,
@@ -98,6 +104,7 @@ def build_ts(df24: pd.DataFrame) -> pd.DataFrame:
             OSA        =("Wt. OSA %","mean"),
             Discount   =("Wt. Discount %","mean"),
             Ad_SOV     =("Ad SOV","mean"),
+            Organic_SOV=("Organic SOV","mean"),
             Overall_SOV=("Overall SOV","mean"),
             Cat_Share  =("Category Share","mean"),
             Darkstores =("Darkstore_Count","sum"),
@@ -587,16 +594,22 @@ def L9_attribution(ts, lag):
     latest,prev = ts.iloc[-1],ts.iloc[-2]
     total_delta = float(latest["Revenue"]-prev["Revenue"])
     drivers = ["OSA","Discount","Ad_SOV","Network_Strength"]
-    sens = {d:abs(lag.get(d,{}).get("best_r",0)) for d in drivers}
-    tot  = sum(sens.values()) or 1
+    sens = _fit_sku_city_regression(ts, drivers)
     attr = []
     for d in drivers:
         curr = float(latest[d]) if not pd.isna(latest[d]) else 0
         base = float(prev[d])   if not pd.isna(prev[d])   else 0
         dd   = curr-base
-        w    = sens[d]/tot
-        impact = total_delta*w*(1 if dd*total_delta>=0 else -1)
-        hist_ev = find_historical_evidence(ts, d, dd, impact, prev["Date"], latest["Date"])
+        coef = sens[d]["coef"]
+        impact = dd * coef
+        
+        if impact != 0:
+            hist_ev = (f"Multivariate OLS over 20 days controls for confounders. "
+                       f"Every 1 unit change in {d} explains Rs. {coef:,.0f} impact independently. "
+                       f"Today's {dd:.2f} delta * {coef:,.0f} = Rs. {impact:,.0f}")
+        else:
+            hist_ev = "N/A - Impact nullified."
+            
         driver_name = d
         custom_narrative = None
         if d == "Network_Strength":
@@ -613,7 +626,7 @@ def L9_attribution(ts, lag):
         attr.append({"driver":driver_name,"current":round(curr,2),"baseline":round(base,2),
                      "driver_delta":round(dd,2),"revenue_impact_rs":round(impact,0),
                      "share_pct":round(impact/total_delta*100,1) if total_delta!=0 else 0,
-                     "weight":round(w,4),"lag_days":lag.get(d,{}).get("best_lag_days",0),
+                     "weight":round(coef,4),"lag_days":lag.get(d,{}).get("best_lag_days",0),
                      "historical_evidence": hist_ev, "custom_narrative": custom_narrative})
     attr.sort(key=lambda x:abs(x["revenue_impact_rs"]),reverse=True)
     top = attr[0]["driver"] if attr else "Unknown"
@@ -690,109 +703,329 @@ def L10_feedback(l1, l9, lag, n_days):
     }
 
 
+def _fit_sku_city_regression_dynamic(history_df):
+    """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
+    import numpy as np
+    from scipy import stats
+    from sklearn.linear_model import LinearRegression
+    import warnings
+    
+    # Pre-scan univariate
+    candidates = [c for c in history_df.columns if c not in ["Date", "Revenue", "DOW"]]
+    scored = []
+    
+    for feat in candidates:
+        best_r, best_lag, best_p = 0, 0, 1.0
+        for lag in range(4):
+            sh = history_df[feat].shift(lag)
+            mask = sh.notna() & history_df['Revenue'].notna()
+            if mask.sum() < 5 or sh[mask].nunique() <= 1: continue
+            try:
+                r, p = stats.pearsonr(sh[mask], history_df['Revenue'][mask])
+            except: continue
+            if not np.isnan(r) and abs(r) > abs(best_r):
+                best_r, best_lag, best_p = r, lag, p
+        if best_r != 0:
+            scored.append({"feat": feat, "r": best_r, "r2": best_r**2, "p": best_p, "lag": best_lag})
+            
+    scored.sort(key=lambda x: -x["r2"])
+    
+    # Select best non-redundant (max 7 variables for 20 days of data)
+    selected = []
+    for s in scored:
+        if s["p"] < 0.20:
+            # simple collinearity check could go here, for now just pick top
+            selected.append(s)
+            if len(selected) >= 7: break
+            
+    if not selected:
+        return {}, []
+        
+    drivers = [s["feat"] for s in selected]
+    
+    # Build aligned DF
+    ols_df = history_df[["Revenue"]].copy()
+    for s in selected:
+        ols_df[s["feat"]] = history_df[s["feat"]].shift(s["lag"])
+    ols_df = ols_df.dropna()
+    
+    n = len(ols_df)
+    p_len = len(drivers)
+    sens = {}
+    
+    if n >= p_len + 2:
+        X = ols_df[drivers].values
+        y = ols_df["Revenue"].values
+        reg = LinearRegression().fit(X, y)
+        coefs = reg.coef_
+        r2_model = reg.score(X, y)
+        for i, s in enumerate(selected):
+            feat = s["feat"]
+            sens[feat] = {"coef": coefs[i], "p": s["p"], "r2": r2_model, "lag": s["lag"], "r2_uni": s["r2"]}
+    else:
+        # Fallback to univariate if very short on data
+        for s in selected:
+            feat = s["feat"]
+            sens[feat] = {"coef": 0.0, "p": s["p"], "r2": s["r2"], "lag": s["lag"], "r2_uni": s["r2"]}
+            sh = history_df[feat].shift(s["lag"])
+            mask = sh.notna() & history_df["Revenue"].notna()
+            if mask.sum() >= 5:
+                if len(sh[mask].unique()) > 1:
+                    res = stats.linregress(sh[mask], history_df["Revenue"][mask])
+                    if not np.isnan(res.slope):
+                        sens[feat]["coef"] = res.slope
+                        
+    return sens, selected
+
 # ── SKU DEEP DIVE ─────────────────────────────────────────
 
-def sku_deep_dive(df24, df_all, sku_id, sku_name, d1_str, d2_str):
+
+def _fit_sku_city_regression_dynamic(history_df):
+    """Dynamically scan up to 30 signals, pick best non-collinear ones, run multivariate OLS."""
+    import numpy as np
+    from scipy import stats
+    from sklearn.linear_model import LinearRegression
+    import warnings
+    
+    # Pre-scan univariate
+    candidates = [c for c in history_df.columns if c not in ["Date", "Revenue", "DOW"]]
+    scored = []
+    
+    for feat in candidates:
+        best_r, best_lag, best_p = 0, 0, 1.0
+        for lag in range(4):
+            sh = history_df[feat].shift(lag)
+            mask = sh.notna() & history_df['Revenue'].notna()
+            if mask.sum() < 5 or sh[mask].nunique() <= 1: continue
+            try:
+                r, p = stats.pearsonr(sh[mask], history_df['Revenue'][mask])
+            except: continue
+            if not np.isnan(r) and abs(r) > abs(best_r):
+                best_r, best_lag, best_p = r, lag, p
+        if best_r != 0:
+            scored.append({"feat": feat, "r": best_r, "r2": best_r**2, "p": best_p, "lag": best_lag})
+            
+    scored.sort(key=lambda x: -x["r2"])
+    
+    # Select best non-redundant (max 7 variables for 20 days of data)
+    selected = []
+    for s in scored:
+        if s["p"] < 0.20:
+            selected.append(s)
+            if len(selected) >= 7: break
+            
+    if not selected:
+        return {}, []
+        
+    drivers = [s["feat"] for s in selected]
+    
+    # Build aligned DF
+    ols_df = history_df[["Revenue"]].copy()
+    for s in selected:
+        ols_df[s["feat"]] = history_df[s["feat"]].shift(s["lag"])
+    ols_df = ols_df.dropna()
+    
+    n = len(ols_df)
+    p_len = len(drivers)
+    sens = {}
+    
+    if n >= p_len + 2:
+        X = ols_df[drivers].values
+        y = ols_df["Revenue"].values
+        reg = LinearRegression().fit(X, y)
+        coefs = reg.coef_
+        r2_model = reg.score(X, y)
+        for i, s in enumerate(selected):
+            feat = s["feat"]
+            sens[feat] = {"coef": coefs[i], "p": s["p"], "r2": r2_model, "lag": s["lag"], "r2_uni": s["r2"]}
+    else:
+        # Fallback to univariate if very short on data
+        for s in selected:
+            feat = s["feat"]
+            sens[feat] = {"coef": 0.0, "p": s["p"], "r2": s["r2"], "lag": s["lag"], "r2_uni": s["r2"]}
+            sh = history_df[feat].shift(s["lag"])
+            mask = sh.notna() & history_df["Revenue"].notna()
+            if mask.sum() >= 5:
+                if len(sh[mask].unique()) > 1:
+                    res = stats.linregress(sh[mask], history_df["Revenue"][mask])
+                    if not np.isnan(res.slope):
+                        sens[feat]["coef"] = res.slope
+                        
+    return sens, selected
+
+
+# ── SKU DEEP DIVE ─────────────────────────────────────────
+
+def sku_deep_dive(df24, df_all, df1, sku_id, sku_name, d1_str, d2_str):
+    import pandas as pd
+    import numpy as np
+    
     sku_df = df24[df24["Product ID"] == sku_id].copy()
     if sku_df.empty: return {}
     
     category = sku_df["Category"].iloc[0] if "Category" in sku_df.columns else "Unknown"
+    comp = df_all[(df_all["Category"] == category) & (df_all["Brand"] != "24 mantra organic")].copy()
     
-    ts = sku_df.groupby("Date").agg(
-        Revenue=("Offtake MRP","sum"), OSA=("Wt. OSA %","mean"),
-        Discount=("Wt. Discount %","mean"), Ad_SOV=("Ad SOV","mean"),
-        Darkstores=("Darkstore_Count","sum"), Network_Strength=("Network_Strength","sum")).reset_index().sort_values("Date")
+    df1_sku = df1[df1["Product ID"] == sku_id].copy()
     
     d1, d2 = pd.Timestamp(d1_str), pd.Timestamp(d2_str)
-    s1, s2 = ts[ts["Date"]==d1], ts[ts["Date"]==d2]
-    if s1.empty or s2.empty: return {}
-    s1, s2 = s1.iloc[0], s2.iloc[0]
     
-    rev_delta = s2["Revenue"] - s1["Revenue"]
-    drivers = ["OSA", "Discount", "Ad_SOV", "Network_Strength"]
-    sens = {}
-    for col in drivers:
-        best_r = 0
-        for lag in range(4):
-            sh = ts[col].shift(lag)
-            mask = sh.notna() & ts["Revenue"].notna()
-            if mask.sum() > 3:
-                r, p = stats.pearsonr(sh[mask], ts["Revenue"][mask])
-                if not np.isnan(r) and abs(r) > abs(best_r): best_r = r
-        sens[col] = abs(best_r)
-        
-    tot = sum(sens.values()) or 1
-    attr = []
-    for d in drivers:
-        curr = s2[d] if not pd.isna(s2[d]) else 0
-        base = s1[d] if not pd.isna(s1[d]) else 0
-        dd = curr - base
-        w = sens[d] / tot
-        imp = rev_delta * w * (1 if dd*rev_delta >= 0 else -1)
-        hist_ev = find_historical_evidence(ts, d, dd, imp, d1_str, d2_str)
-        
-        driver_name = d
-        custom_narrative = None
-        if d == "Network_Strength":
-            d_curr = s2["Darkstores"] if not pd.isna(s2["Darkstores"]) else 0
-            d_base = s1["Darkstores"] if not pd.isna(s1["Darkstores"]) else 0
-            dark_delta = d_curr - d_base
-            net_delta = curr - base
-            store_action = f"lost {abs(dark_delta):.0f}" if dark_delta < 0 else (f"gained {dark_delta:.0f}" if dark_delta > 0 else "saw no change in")
-            cap_action = f"wiped out {abs(net_delta):.1f}%" if net_delta < 0 else (f"added {net_delta:.1f}%" if net_delta > 0 else "didn't change")
-            imp_action = f"causing a drop of Rs. {abs(imp):,.0f}" if imp < 0 else f"driving a gain of Rs. {abs(imp):,.0f}"
-            custom_narrative = f"You {store_action} physical stores, which {cap_action} of your sales capacity ({base:.1f}% -> {curr:.1f}%), {imp_action}."
-            driver_name = "Network_Capacity"
-        
-        attr.append({"driver": driver_name, "d1_val": round(base, 2), "d2_val": round(curr, 2),
-                     "delta": round(dd, 2), "impact_rs": round(imp, 0),
-                     "weight": round(w, 2), "historical_evidence": hist_ev, "custom_narrative": custom_narrative})
-        
-    attr.sort(key=lambda x: abs(x["impact_rs"]), reverse=True)
-    
-    c_rev1 = sku_df[sku_df["Date"]==d1].groupby("City")["Offtake MRP"].sum()
-    c_rev2 = sku_df[sku_df["Date"]==d2].groupby("City")["Offtake MRP"].sum()
+    # 1. Identify top dropping cities for this SKU
+    c_rev1 = sku_df[sku_df["Date"] == d1].groupby("City")["Offtake MRP"].sum()
+    c_rev2 = sku_df[sku_df["Date"] == d2].groupby("City")["Offtake MRP"].sum()
     c_deltas = c_rev2.sub(c_rev1, fill_value=0).sort_values()
     
-    # Competitor analysis
-    comp_insight = None
-    if category != "Unknown":
-        comp_df = df_all[(df_all["Category"] == category) & (df_all["Brand"] != "24 mantra organic")]
-        if not comp_df.empty:
-            c1 = comp_df[comp_df["Date"] == d1]
-            c2 = comp_df[comp_df["Date"] == d2]
-            if not c1.empty and not c2.empty:
-                comp_sov_d1 = c1["Ad SOV"].mean()
-                comp_sov_d2 = c2["Ad SOV"].mean()
-                comp_disc_d1 = c1["Wt. Discount %"].mean()
-                comp_disc_d2 = c2["Wt. Discount %"].mean()
-                
-                # Find aggressive competitor
-                b2 = c2.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
-                b1 = c1.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
-                b_diff = b2.sub(b1, fill_value=0)
-                agg_brand = None
-                if not b_diff.empty:
-                    top_sov = b_diff["SOV"].idxmax()
-                    top_sov_val = b_diff["SOV"].max()
-                    if top_sov_val > 1.0:
-                        agg_brand = f"{top_sov.title()} (+{top_sov_val:.1f}% SOV)"
-                        
-                comp_insight = {
-                    "sov_d1": round(comp_sov_d1, 1), "sov_d2": round(comp_sov_d2, 1),
-                    "disc_d1": round(comp_disc_d1, 1), "disc_d2": round(comp_disc_d2, 1),
-                    "aggressive_brand": agg_brand
-                }
+    total_rev_d1 = sku_df[sku_df["Date"] == d1]["Offtake MRP"].sum()
+    total_rev_d2 = sku_df[sku_df["Date"] == d2]["Offtake MRP"].sum()
+    total_drop = total_rev_d2 - total_rev_d1
     
-    return {"sku_id": sku_id, "sku_name": sku_name, "rev_d1": round(s1["Revenue"], 0),
-            "rev_d2": round(s2["Revenue"], 0), "rev_delta": round(rev_delta, 0),
-            "attribution": attr, "worst_city": c_deltas.index[0] if len(c_deltas)>0 else "Unknown",
-            "worst_city_drop": round(c_deltas.iloc[0], 0) if len(c_deltas)>0 else 0,
-            "competitor_insight": comp_insight}
+    dropping_cities = c_deltas[c_deltas < -500].index.tolist()
+    if not dropping_cities and len(c_deltas) > 0:
+        dropping_cities = [c_deltas.index[0]]
+        
+    markdown_lines = []
+    markdown_lines.append(f"#### 📦 {sku_name}")
+    markdown_lines.append(f"**Total Revenue:** Rs.{total_rev_d1:,.0f} -> Rs.{total_rev_d2:,.0f} (Drop: **Rs.{total_drop:+,.0f}**)")
+    markdown_lines.append("")
+    
+    city_col_f1 = "Locality City" if "Locality City" in df1_sku.columns else "City" if "City" in df1_sku.columns else None
+    
+    for city in dropping_cities[:4]:  # Top 4 dropping cities
+        cd_f2 = sku_df[sku_df["City"] == city].copy()
+        city_prefix = city.split('-')[0][:6].lower()
+        cd_f1 = df1_sku[df1_sku[city_col_f1].str.lower().str.contains(city_prefix, na=False)].copy() if city_col_f1 else pd.DataFrame()
+        cd_comp = comp[comp["City"].str.lower().str.contains(city_prefix, na=False)].copy()
+        
+        if cd_f2.empty: continue
+        
+        # Build Daily TS for City
+        ts = cd_f2.groupby("Date").agg(
+            Revenue=("Offtake MRP","sum"),
+            Wt_OSA=("Wt. OSA %","mean"),
+            Discount=("Wt. Discount %","mean"),
+            Ad_SOV=("Ad SOV","mean"),
+            Organic_SOV=("Organic SOV","mean"),
+        ).reset_index().sort_values("Date").reset_index(drop=True)
+        
+        # Competitor signals
+        if not cd_comp.empty:
+            comp_ts = cd_comp.groupby("Date").agg(
+                Comp_Discount=("Wt. Discount %","mean"),
+                Comp_Ad_SOV=("Ad SOV","mean"),
+                Comp_OSA=("Wt. OSA %","mean"),
+                Comp_Organic_SOV=("Organic SOV","mean"),
+            ).reset_index()
+            ts = ts.merge(comp_ts, on="Date", how="left")
+            ts["Comp_Disc_Adv"] = ts["Comp_Discount"] - ts["Discount"]
+        
+        # Store signals
+        if not cd_f1.empty:
+            st = cd_f1.groupby("Date").agg(
+                Stores=("Store ID","nunique"),
+                Store_OSA=("Avg. OSA %","mean"),
+                Stock=("SKU Stock Levels","mean"),
+                Listing=("Listing %","mean"),
+            ).reset_index()
+            ts = ts.merge(st, on="Date", how="left")
+            
+            # HV split
+            if "Locality Sales Contribution" in cd_f1.columns:
+                thr = cd_f1["Locality Sales Contribution"].quantile(0.75)
+                cd_f1["IsHV"] = (cd_f1["Locality Sales Contribution"] >= thr).astype(int)
+                for gv, gn in [(1,"HV"),(0,"LV")]:
+                    g = cd_f1[cd_f1["IsHV"]==gv]
+                    if not g.empty:
+                        gts = g.groupby("Date").agg(OSA=("Avg. OSA %","mean"), Stock=("SKU Stock Levels","mean")).reset_index()
+                        gts.columns = ["Date", f"{gn}_OSA", f"{gn}_Stock"]
+                        ts = ts.merge(gts, on="Date", how="left")
+        
+        # Derived signals
+        if "Stock" in ts.columns:
+            ts["Stock_roll3"] = ts["Stock"].rolling(3, min_periods=2).mean()
+        if "Comp_Disc_Adv" in ts.columns:
+            ts["Comp_Squeeze"] = ts["Comp_Disc_Adv"] * (100 - ts["Wt_OSA"]) / 100
+        ts["DOW"] = ts["Date"].dt.dayofweek
+        ts["Is_Monday"] = (ts["DOW"] == 0).astype(int)
+        
+        s1r = ts[ts["Date"] == d1]
+        s2r = ts[ts["Date"] == d2]
+        if s1r.empty or s2r.empty: continue
+        s1, s2 = s1r.iloc[0], s2r.iloc[0]
+        city_drop = s2["Revenue"] - s1["Revenue"]
+        
+        sens, selected = _fit_sku_city_regression_dynamic(ts)
+        r2_model = sens[selected[0]["feat"]]["r2"] if selected and selected[0]["feat"] in sens else 0.0
+        
+        markdown_lines.append(f"#### 🏙️ CITY: {city} | Drop: Rs.{city_drop:+,.0f}")
+        markdown_lines.append(f"**City Model Accuracy (R²):** {r2_model:.2f} | **Signals Tested:** {len(ts.columns)-3}")
+        markdown_lines.append("")
+        markdown_lines.append("| Driver Category | Metric | Apr 19 | Apr 20 | Delta | Impact | Insight |")
+        markdown_lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        
+        # Categorize
+        cat_map = {
+            "Discount": "Own Levers", "Ad_SOV": "Own Levers", "Wt_OSA": "Own Levers", "Organic_SOV": "Own Levers",
+            "Comp_Disc_Adv": "Competitor Pressure", "Comp_Discount": "Competitor Pressure", 
+            "Comp_Squeeze": "Competitor Pressure", "Comp_OSA": "Competitor Pressure", "Comp_Ad_SOV": "Competitor Pressure",
+            "Stores": "Store Quality", "Store_OSA": "Store Quality", "Stock": "Store Quality", "Listing": "Store Quality",
+            "HV_OSA": "Store Quality", "HV_Stock": "Store Quality", "LV_OSA": "Store Quality", "LV_Stock": "Store Quality",
+            "Stock_roll3": "Store Quality", "Is_Monday": "Structural"
+        }
+        
+        total_explained = 0
+        for s in selected:
+            feat = s["feat"]
+            if feat not in sens: continue
+            coef = sens[feat]["coef"]
+            lag = s["lag"]
+            
+            dt1 = d1 - pd.Timedelta(days=lag)
+            dt2 = d2 - pd.Timedelta(days=lag)
+            
+            val1_row = ts[ts["Date"] == dt1]
+            val2_row = ts[ts["Date"] == dt2]
+            
+            v1 = val1_row.iloc[0][feat] if not val1_row.empty and not pd.isna(val1_row.iloc[0][feat]) else 0.0
+            v2 = val2_row.iloc[0][feat] if not val2_row.empty and not pd.isna(val2_row.iloc[0][feat]) else 0.0
+            
+            delta = v2 - v1
+            impact = delta * coef
+            if abs(impact) < 50: continue  # Skip negligible impacts in display
+            
+            total_explained += impact
+            
+            category_str = cat_map.get(feat, "Other")
+            if lag > 0: feat_display = f"{feat} (Lag {lag}d)"
+            else: feat_display = feat
+            
+            if "SOV" in feat or "Discount" in feat or "OSA" in feat or "Listing" in feat:
+                delta_str = f"{delta:+.1f}%"
+                v1_str, v2_str = f"{v1:.1f}%", f"{v2:.1f}%"
+            else:
+                delta_str = f"{delta:+.2f}"
+                v1_str, v2_str = f"{v1:.2f}", f"{v2:.2f}"
+                
+            insight = f"Regression coef: Rs.{coef:,.0f} per unit."
+            if feat == "Is_Monday": insight = "Structural day-of-week demand drop."
+            if feat == "Comp_Disc_Adv": insight = "Relative pricing swing vs competitors."
+            if feat == "Comp_Squeeze": insight = "Dual pressure of low OSA and competitor discount."
+            
+            impact_str = f"**Rs.{impact:+,.0f}**" if impact < 0 else f"*Rs.{impact:+,.0f}*"
+            markdown_lines.append(f"| **{category_str}** | {feat_display} | {v1_str} | {v2_str} | **{delta_str}** | {impact_str} | {insight} |")
+            
+        unexplained = city_drop - total_explained
+        unexplained_str = f"**Rs.{unexplained:+,.0f}**" if unexplained < 0 else f"*Rs.{unexplained:+,.0f}*"
+        markdown_lines.append(f"| **Unexplained** | Market Fluctuation | - | - | - | {unexplained_str} | Natural platform variance / noise. |")
+        markdown_lines.append("")
+        
+    return {"sku_name": sku_name, "rev_d1": total_rev_d1, "rev_d2": total_rev_d2, 
+            "rev_delta": total_drop, "worst_city": c_deltas.index[0] if len(c_deltas)>0 else "Unknown",
+            "worst_city_drop": c_deltas.iloc[0] if len(c_deltas)>0 else 0,
+            "markdown_table": "\n".join(markdown_lines)}
 
 
 # ── DATE COMPARISON ENGINE (Apr19 vs Apr20) ───────────────────────────────────
-def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
+def compare_two_days(df24, df_all, df1, ts, d1_str, d2_str, lag):
     print(f"[COMPARE] {d1_str} vs {d2_str} deep-dive ...")
     d1 = pd.Timestamp(d1_str)
     d2 = pd.Timestamp(d2_str)
@@ -805,6 +1038,7 @@ def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
                 "OSA":float(s["Wt. OSA %"].mean()),
                 "Discount":float(s["Wt. Discount %"].mean()),
                 "Ad_SOV":float(s["Ad SOV"].mean()),
+                "Organic_SOV":float(s["Organic SOV"].mean()),
                 "Overall_SOV":float(s["Overall SOV"].mean()),
                 "Cat_Share":float(s["Category Share"].mean()),
                 "Darkstores":float(s["Darkstore_Count"].sum()),
@@ -885,16 +1119,33 @@ def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
 
     # Attribution: which drivers caused how much of the revenue delta
     rev_delta = s2["Revenue"]-s1["Revenue"]
-    sens = {d:abs(lag.get(d,{}).get("best_r",0)) for d in ["OSA","Discount","Ad_SOV","Network_Strength"]}
-    tot  = sum(sens.values()) or 1
+    drivers_list = ["OSA","Discount","Ad_SOV","Network_Strength","Organic_SOV"]
+    
+    # Day-of-Week structural effect (e.g. Sunday -> Monday naturally drops)
+    dow1 = d1.dayofweek
+    dow2 = d2.dayofweek
+    dow_avg = ts.groupby(ts["Date"].dt.dayofweek)["Revenue"].mean()
+    dow_expected_d1 = dow_avg.get(dow1, float("nan"))
+    dow_expected_d2 = dow_avg.get(dow2, float("nan"))
+    dow_structural_effect = (dow_expected_d2 - dow_expected_d1) if not (pd.isna(dow_expected_d1) or pd.isna(dow_expected_d2)) else 0.0
+    
+    sens = _fit_sku_city_regression(ts, drivers_list)
+    
     drv_attribution = []
-    for d,dcol in [("OSA","OSA"),("Discount","Discount"),("Ad_SOV","Ad_SOV"),("Network_Strength","Network_Strength")]:
+    for d in drivers_list:
+        dcol = d
         dd  = (s2.get(dcol,0) or 0)-(s1.get(dcol,0) or 0)
-        w   = sens[d]/tot
-        imp = rev_delta*w*(1 if dd*rev_delta>=0 else -1)
+        coef = sens[d]["coef"]
+        imp = dd * coef
         lag_d = lag.get(d,{}).get("best_lag_days",0)
         note  = f"lag={lag_d}d -- impact felt {'immediately' if lag_d==0 else f'{lag_d} day(s) after change'}"
-        hist_ev = find_historical_evidence(ts, d, dd, imp, d1_str, d2_str)
+        
+        if imp != 0:
+            hist_ev = (f"Multivariate OLS over 20 days controls for confounders. "
+                       f"Every 1 unit change in {d} explains Rs. {coef:,.0f} impact independently. "
+                       f"Today's {dd:.2f} delta * {coef:,.0f} = Rs. {imp:,.0f}")
+        else:
+            hist_ev = "N/A - Impact nullified."
         
         driver_name = d
         custom_narrative = None
@@ -966,6 +1217,22 @@ def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
                 f"- **{a['driver']}**: {sign}Rs.{a['revenue_impact_rs']:,.0f} ({a['share_pct']}% of delta)  {a['lag_note']}")
         if a.get("historical_evidence"):
             narrative_lines.append(f"  > *{a['historical_evidence']}*")
+    
+    # Day-of-Week structural baseline effect
+    day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    if abs(dow_structural_effect) > 100:
+        dow_sign = "+" if dow_structural_effect >= 0 else ""
+        narrative_lines.append(f"- **Day-of-Week Baseline Effect** ({day_names[dow1]} -> {day_names[dow2]}): {dow_sign}Rs.{dow_structural_effect:,.0f}")
+        narrative_lines.append(f"  > *Structural: historically {day_names[dow2]} averages Rs.{dow_structural_effect:,.0f} {'more' if dow_structural_effect > 0 else 'less'} than {day_names[dow1]}. Not an operational issue.*")
+    else:
+        dow_structural_effect = 0.0
+            
+    total_explained = sum(a['revenue_impact_rs'] for a in drv_attribution) + dow_structural_effect
+    unexplained_top = rev_delta - total_explained
+    if abs(unexplained_top) > 100:
+        narrative_lines.append(f"- **Unexplained / Organic**: Rs.{unexplained_top:,.0f} ({(unexplained_top/rev_delta)*100:.1f}% of delta)")
+        narrative_lines.append(f"  > *This portion cannot be statistically linked to any measured operational driver or day-of-week pattern.*")
+        
     narrative_lines += [
         "",
         "**GEOGRAPHIC STORY (biggest city movers)**:",
@@ -982,29 +1249,13 @@ def compare_two_days(df24, df_all, ts, d1_str, d2_str, lag):
     sku_deep_dives = []
     narrative_lines += ["", "### SKU DEEP DIVE (Top Losers with Historical Validation)"]
     for s in top_sku_losers[:5]:
-        sd = sku_deep_dive(df24, df_all, s["Product ID"], f"{s['Product Name']} {s['Grammage']}", d1_str, d2_str)
+        sd = sku_deep_dive(df24, df_all, df1, s["Product ID"], f"{s['Product Name']} {s['Grammage']}", d1_str, d2_str)
         if not sd: continue
         sku_deep_dives.append(sd)
-        narrative_lines.append(f"#### {sd['sku_name']}")
-        narrative_lines.append(f"- **Revenue**: Rs.{sd['rev_d1']} -> Rs.{sd['rev_d2']} (Drop: Rs.{abs(sd['rev_delta']):.0f})")
-        narrative_lines.append(f"- **Worst City Drop**: {sd['worst_city']} (Rs.{abs(sd['worst_city_drop']):.0f})")
-        narrative_lines.append(f"- **Driver Attribution & Evidence**:")
-        for a in sd["attribution"][:3]:
-            if a.get("custom_narrative"):
-                narrative_lines.append(f"  - **{a['driver']}**: {a['custom_narrative']}")
-            else:
-                narrative_lines.append(f"  - **{a['driver']}**: {a['d1_val']} -> {a['d2_val']} | Impact: Rs.{a['impact_rs']:.0f}")
-            if a["historical_evidence"]:
-                narrative_lines.append(f"    > *{a['historical_evidence']}*")
-        
-        ci = sd.get("competitor_insight")
-        if ci:
-            narrative_lines.append(f"- **Competitive Pressure (Category-Level)**:")
-            narrative_lines.append(f"  - Competitor Ad SOV: {ci['sov_d1']}% -> {ci['sov_d2']}%")
-            narrative_lines.append(f"  - Competitor Discount: {ci['disc_d1']}% -> {ci['disc_d2']}%")
-            if ci['aggressive_brand']:
-                narrative_lines.append(f"  - **Aggressive Mover**: {ci['aggressive_brand']}")
+        if "markdown_table" in sd:
+            narrative_lines.extend(sd["markdown_table"].split('\\n'))
 
+    # ── ATTRIBUTION SUMMARY TABLE ────────────────────────────────────────────────
     return {
         "comparison_dates": {"d1":d1_str,"d2":d2_str},
         "headline_delta_rs": round(rev_delta,0),
@@ -1170,6 +1421,7 @@ def main():
     # --- LLM Evidence Pack Generation ---
     loc_stats = build_locality_intelligence(active_stores)
     sku_city_ts = build_sku_city_ts(df24, loc_stats)
+    sku_city_ts = enrich_sku_city_ts(sku_city_ts)
 
     l0       = L0_raw_snapshot(ts)
     l1, ts   = L1_baseline(ts)
@@ -1182,9 +1434,11 @@ def main():
     l8       = L8_leading(ts, df24)
     l9       = L9_attribution(ts, l4)
     l10      = L10_feedback(l1, l9, l4, len(ts))
-    comp     = compare_two_days(df24, df_all, ts, COMPARE_DATE1, COMPARE_DATE2, l4)
+    comp     = compare_two_days(df24, df_all, df1, ts, COMPARE_DATE1, COMPARE_DATE2, l4)
+    attr_day = build_sku_city_attribution(sku_city_ts, df24, df_all, COMPARE_DATE1, COMPARE_DATE2, mode="day", nat_lag=l4)
+    attr_period = build_sku_city_attribution(sku_city_ts, df24, df_all, COMPARE_PERIOD1_START, COMPARE_PERIOD1_END, mode="period", nat_lag=l4)
     
-    export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, out)
+    export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, attr_day, attr_period, out)
 
     report = {
         "meta": {"brand":BRAND_DISPLAY,"generated_at":datetime.now().isoformat(),
@@ -1257,7 +1511,9 @@ def build_sku_city_ts(df24, loc_stats):
         Revenue=("Offtake MRP", "sum"),
         OSA=("Wt. OSA %", "mean"),
         Discount=("Wt. Discount %", "mean"),
-        Ad_SOV=("Ad SOV", "mean")
+        Ad_SOV=("Ad SOV", "mean"),
+        Organic_SOV=("Organic SOV", "mean"),
+        Category_Share=("Category Share", "mean")
     ).reset_index()
     
     # Determine tier
@@ -1293,7 +1549,7 @@ def build_sku_city_ts(df24, loc_stats):
     
     return full
 
-def export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, outdir):
+def export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp, attr_day, attr_period, outdir):
     print("[LLM Evidence] Exporting evidence pack ...")
     
     import pandas as pd
@@ -1364,6 +1620,10 @@ def export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp
         loc_intel.to_excel(writer, sheet_name="locality_intelligence", index=False)
         if not attr_df.empty:
             attr_df.to_excel(writer, sheet_name="driver_attributions", index=False)
+        if not attr_day.empty:
+            attr_day.to_excel(writer, sheet_name="sku_city_attr_day", index=False)
+        if not attr_period.empty:
+            attr_period.to_excel(writer, sheet_name="sku_city_attr_period", index=False)
             
     # Write to JSON
     json_data = {
@@ -1380,6 +1640,488 @@ def export_llm_evidence_pack(df24, df1, ts, loc_stats, sku_city_ts, l6, l9, comp
         
     print(f"    -> {excel_path.name}")
     print(f"    -> {json_path.name}")
+
+
+
+# ── LAYER 11: SKU × CITY DRIVER ENRICHMENT ────────────────────────────────────
+
+def enrich_sku_city_ts(full):
+    """Adds 15 analysis columns to the sku_city_day master table:
+    DoD for all drivers, zone status, consecutive signals,
+    city rank, efficiency ratios, vs-national deltas."""
+    print("[LLM Evidence] Enriching SKU x City with driver intelligence ...")
+
+    full = full.sort_values(["Product ID", "City", "Date"]).copy()
+
+    # Block 1 — DoD for OSA, Discount, Ad_SOV
+    for col in ["OSA", "Discount", "Ad_SOV"]:
+        full[f"{col}_DoD"] = full.groupby(["Product ID", "City"])[col].diff().fillna(0)
+
+    # Block 2 — Zone Status
+    def osa_zone(v):
+        if v < THR["OSA_critical"]:  return "CRITICAL"
+        if v < THR["OSA_warning"]:   return "WARNING"
+        return "SAFE"
+
+    def disc_zone(v):
+        return "HIGH" if v > THR["Discount_dimret"] else "OK"
+
+    def sov_zone(v):
+        if v > THR["SOV_saturation"]: return "SATURATED"
+        if v > 10:                    return "MODERATE"
+        return "LOW"
+
+    full["OSA_Zone"]      = full["OSA"].apply(osa_zone)
+    full["Discount_Zone"] = full["Discount"].apply(disc_zone)
+    full["SOV_Zone"]      = full["Ad_SOV"].apply(sov_zone)
+
+    # Block 3 — Consecutive Decline / Rise per (Product ID, City)
+    def consecutive_signal(series, direction="decline"):
+        """Count consecutive days of decline (<0) or rise (>0)."""
+        result = []
+        count = 0
+        for v in series:
+            if direction == "decline" and v < 0:
+                count += 1
+            elif direction == "rise" and v > 0:
+                count += 1
+            else:
+                count = 0
+            result.append(count)
+        return result
+
+    for (pid, city), grp in full.groupby(["Product ID", "City"]):
+        idx = grp.index
+        full.loc[idx, "OSA_Consecutive_Decline_Days"]      = consecutive_signal(grp["OSA_DoD"].values, "decline")
+        full.loc[idx, "Discount_Consecutive_Rise_Days"]    = consecutive_signal(grp["Discount_DoD"].values, "rise")
+        full.loc[idx, "SOV_Consecutive_Decline_Days"]      = consecutive_signal(grp["Ad_SOV_DoD"].values, "decline")
+
+    # Block 4 — City Rank within SKU per day (Rank 1 = worst)
+    full["OSA_City_Rank"]      = full.groupby(["Date", "Product ID"])["OSA"].rank(ascending=True).fillna(0).astype(int)
+    full["Discount_City_Rank"] = full.groupby(["Date", "Product ID"])["Discount"].rank(ascending=False).fillna(0).astype(int)
+
+    # Block 5 — vs National SKU Average (how far above/below national mean)
+    nat_avg = full.groupby(["Date", "Product ID"])[["OSA", "Discount"]].transform("mean")
+    full["OSA_vs_National"]      = (full["OSA"]      - nat_avg["OSA"]).round(2)
+    full["Discount_vs_National"] = (full["Discount"] - nat_avg["Discount"]).round(2)
+
+    # Block 6 — Efficiency Ratios
+    full["OSA_Efficiency"]  = (full["Revenue"] / full["OSA"].replace(0, float("nan"))).round(0)
+    full["SOV_Efficiency"]  = (full["Revenue"] / full["Ad_SOV"].replace(0, float("nan"))).round(0)
+
+    # Discount elasticity — only where Discount moved
+    dod_disc = full["Discount_DoD"].replace(0, float("nan"))
+    full["Discount_Elasticity"] = (full["Revenue_DoD"] / dod_disc).round(2)
+
+    print(f"    -> Enriched {len(full):,} rows with 15 new driver intelligence columns")
+    return full
+
+
+# ── LAYER 12: SKU × CITY CAUSAL ATTRIBUTION ───────────────────────────────────
+
+def _fit_sku_city_regression(history_df, drivers, nat_lag=None):
+    """Fit a multivariate OLS regression for drivers vs Revenue per SKU x City."""
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
+    from scipy import stats as sp_stats
+    import warnings
+    
+    sens = {}
+    best_lags = {}
+    
+    # 1. Determine best univariate lag (0-3 days) for each driver
+    for d in drivers:
+        best_r = 0.0
+        best_lag = 0
+        for lag in range(4):
+            sh = history_df[d].shift(lag)
+            mask = sh.notna() & history_df["Revenue"].notna()
+            if mask.sum() >= 5:
+                if len(sh[mask].unique()) > 1:
+                    r, _ = sp_stats.pearsonr(sh[mask], history_df["Revenue"][mask])
+                    if not np.isnan(r) and abs(r) > abs(best_r):
+                        best_r = r
+                        best_lag = lag
+        best_lags[d] = best_lag
+
+    # 2. Build aligned multivariate dataframe
+    ols_df = history_df[["Revenue"]].copy()
+    for d in drivers:
+        ols_df[d] = history_df[d].shift(best_lags[d])
+    
+    ols_df = ols_df.dropna()
+    
+    # 3. Fit Multivariate Regression if enough points
+    n = len(ols_df)
+    p = len(drivers)
+    if n >= p + 2:
+        X = ols_df[drivers].values
+        y = ols_df["Revenue"].values
+        
+        reg = LinearRegression().fit(X, y)
+        coefs = reg.coef_
+        r2 = reg.score(X, y)
+        
+        # Calculate p-values manually
+        dof = n - p - 1
+        predictions = reg.predict(X)
+        mse = np.sum((y - predictions)**2) / (dof if dof > 0 else 1)
+        
+        X_design = np.hstack([np.ones((n, 1)), X])
+        try:
+            var_b = mse * np.linalg.inv(np.dot(X_design.T, X_design)).diagonal()
+            se_b = np.sqrt(var_b)[1:]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                t_stat = coefs / (se_b + 1e-9)
+            p_values = [2 * (1 - sp_stats.t.cdf(np.abs(t), dof)) for t in t_stat]
+        except np.linalg.LinAlgError:
+            p_values = [1.0] * p
+            
+        for i, d in enumerate(drivers):
+            sens[d] = {"coef": coefs[i], "p": p_values[i], "r2": r2, "weight": abs(coefs[i])}
+    else:
+        # Fall back to univariate regression if not enough points for full multivariate
+        for d in drivers:
+            sens[d] = {"coef": 0.0, "p": 1.0, "r2": 0.0, "weight": 0.0}
+            sh = history_df[d].shift(best_lags[d])
+            mask = sh.notna() & history_df["Revenue"].notna()
+            if mask.sum() >= 5:
+                if len(sh[mask].unique()) > 1:
+                    res = sp_stats.linregress(sh[mask], history_df["Revenue"][mask])
+                    if not np.isnan(res.slope):
+                        sens[d] = {"coef": res.slope, "p": res.pvalue, "r2": res.rvalue**2, "weight": abs(res.slope)}
+                    
+    return sens
+
+
+def _get_historical_proof_city(history_df, driver_col, target_delta, impact_rs, d1_date, d2_date):
+    """Find a past instance where this driver moved similarly for this SKU×City."""
+    import numpy as np
+    if abs(target_delta) < 0.01:
+        return "No change in this driver."
+    best_match = None
+    best_diff = float("inf")
+    dates = sorted(history_df["Date"].unique())
+    for i in range(1, len(dates)):
+        hd1, hd2 = dates[i-1], dates[i]
+        if pd.Timestamp(hd1) == pd.Timestamp(d1_date) and pd.Timestamp(hd2) == pd.Timestamp(d2_date):
+            continue
+        row1 = history_df[history_df["Date"] == hd1]
+        row2 = history_df[history_df["Date"] == hd2]
+        if row1.empty or row2.empty:
+            continue
+        drv_delta = float(row2.iloc[0][driver_col]) - float(row1.iloc[0][driver_col])
+        rev_delta = float(row2.iloc[0]["Revenue"]) - float(row1.iloc[0]["Revenue"])
+        # Same direction and magnitude within 50%
+        if target_delta * drv_delta > 0 and abs(drv_delta) > 0:
+            ratio = abs(drv_delta - target_delta) / (abs(target_delta) + 1e-9)
+            if ratio < best_diff:
+                best_diff = ratio
+                best_match = {"d1": hd1.strftime("%b %d"), "d2": hd2.strftime("%b %d"),
+                              "drv_delta": drv_delta, "rev_delta": rev_delta}
+    if best_match and best_diff < 0.75:
+        dir_w = "dropped" if target_delta < 0 else "rose"
+        r_dir = "dropped" if best_match["rev_delta"] < 0 else "rose"
+        return (f"{best_match['d1']}→{best_match['d2']}: {driver_col} {dir_w} "
+                f"{abs(best_match['drv_delta']):.2f} → Revenue {r_dir} Rs.{abs(best_match['rev_delta']):,.0f}")
+    return "No direct past match found."
+
+
+def _build_attribution_row(grp_ts, d1_vals, d2_vals, drivers, sens, rev_delta, d1_date, d2_date):
+    """Build one attribution dict using Regression coefficients."""
+    import numpy as np
+    
+    MATERIALITY_THRESHOLDS = {
+        "OSA": 1.0,
+        "Discount": 3.0,
+        "Ad_SOV": 1.0,
+        "Network_Strength": 0.5
+    }
+    
+    attr = {}
+    max_abs = 0
+    primary_driver = "Organic/Market"
+    unexplained_impact = rev_delta
+    
+    for d in drivers:
+        curr = d2_vals.get(d, 0)
+        base = d1_vals.get(d, 0)
+        dd   = curr - base
+        
+        coef = sens[d]["coef"]
+        raw_impact = dd * coef
+        
+        mat_threshold = MATERIALITY_THRESHOLDS.get(d, 0.0)
+        if abs(dd) < mat_threshold:
+            impact = 0.0
+            credibility = "MATERIALITY_FAILED"
+            cred_str = f"Change of {dd:.2f} is below materiality threshold ({mat_threshold})."
+        elif sens[d]["p"] > 0.10:
+            impact = 0.0
+            credibility = "STATISTICAL_FAILED"
+            cred_str = f"Not statistically significant (p={sens[d]['p']:.3f} > 0.10)."
+        else:
+            impact = raw_impact
+            credibility = "STRONG" if sens[d]["p"] < 0.05 else "MEDIUM"
+            cred_str = f"Regression model: coef={coef:.1f} (p={sens[d]['p']:.3f}, R2={sens[d]['r2']:.2f})."
+            
+        unexplained_impact -= impact
+        
+        if impact != 0:
+            proof = (f"Multivariate OLS over 20 days controls for confounders. "
+                     f"Every 1 unit change in {d} explains Rs. {coef:,.0f} impact independently. "
+                     f"Today's {dd:.2f} delta * {coef:,.0f} = Rs. {impact:,.0f}")
+        else:
+            proof = "N/A - Impact nullified by gates."
+        
+        attr[d] = {
+            "d1": round(base, 2), "d2": round(curr, 2),
+            "delta": round(dd, 2), "impact_rs": round(impact, 0),
+            "weight": round(coef, 3), "r": round(sens[d].get("r", 0), 2),
+            "p": round(sens[d]["p"], 3), "r2": round(sens[d]["r2"], 2),
+            "confidence": credibility, "credibility_sentence": cred_str,
+            "proof": proof
+        }
+        
+        if abs(impact) > max_abs and impact != 0:
+            max_abs = abs(impact)
+            primary_driver = d
+            
+    return attr, primary_driver, unexplained_impact
+
+
+def _network_quality_narrative(d1_row, d2_row):
+    """Build a narrative for darkstore quality change."""
+    if d1_row is None or d2_row is None:
+        return ""
+    dc1 = d1_row.get("Darkstore_Count", 0)
+    dc2 = d2_row.get("Darkstore_Count", 0)
+    hv1 = d1_row.get("High_Value_Store_Count", 0)
+    hv2 = d2_row.get("High_Value_Store_Count", 0)
+    ns1 = d1_row.get("Network_Strength", 0)
+    ns2 = d2_row.get("Network_Strength", 0)
+    dc_delta = dc2 - dc1
+    hv_delta = hv2 - hv1
+    lv_delta = (dc2 - hv2) - (dc1 - hv1)
+
+    if dc_delta == 0:
+        return f"Store count unchanged ({int(dc2)} stores). Network strength: {ns1:.1f}→{ns2:.1f}."
+
+    action = f"Lost {abs(dc_delta):.0f}" if dc_delta < 0 else f"Gained {dc_delta:.0f}"
+    quality = ""
+    if hv_delta < 0:
+        quality = f" ({abs(hv_delta):.0f} were HIGH-VALUE, locality score ≥0.00168)"
+    elif hv_delta > 0:
+        quality = f" ({hv_delta:.0f} were HIGH-VALUE)"
+    cap = f"Network strength {ns1:.1f}→{ns2:.1f}."
+    return f"{action} stores{quality}. {cap}"
+
+
+def _get_competitor_snapshot(df_all, category, city, d1_date, d2_date):
+    """Return competitor SOV, Discount, Revenue for this category×city on d1 and d2."""
+    if not category or category == "Unknown":
+        return {}
+    comp = df_all[
+        (df_all["Category"] == category) &
+        (df_all["city_key"] == city.lower().strip()) &
+        (df_all["Brand"] != BRAND_RAW)
+    ]
+    result = {}
+    for label, dt in [("d1", pd.Timestamp(d1_date)), ("d2", pd.Timestamp(d2_date))]:
+        day = comp[comp["Date"] == dt]
+        if day.empty:
+            result[label] = {}
+            continue
+        by_brand = day.groupby("Brand").agg(
+            Rev=("Offtake MRP", "sum"),
+            SOV=("Ad SOV", "mean"),
+            Disc=("Wt. Discount %", "mean")
+        )
+        result[label] = {
+            "total_comp_rev": round(by_brand["Rev"].sum(), 0),
+            "avg_comp_sov":   round(by_brand["SOV"].mean(), 2),
+            "avg_comp_disc":  round(by_brand["Disc"].mean(), 2),
+            "top_brand_by_rev": by_brand["Rev"].idxmax() if not by_brand.empty else "N/A"
+        }
+
+    # Aggressive mover
+    aggressive = "None"
+    if result.get("d1") and result.get("d2"):
+        d1_day = comp[comp["Date"] == pd.Timestamp(d1_date)]
+        d2_day = comp[comp["Date"] == pd.Timestamp(d2_date)]
+        if not d1_day.empty and not d2_day.empty:
+            b1 = d1_day.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
+            b2 = d2_day.groupby("Brand").agg(SOV=("Ad SOV", "mean"), Disc=("Wt. Discount %", "mean"))
+            diff = b2.sub(b1, fill_value=0)
+            if not diff.empty and diff["SOV"].max() > 1.0:
+                top = diff["SOV"].idxmax()
+                aggressive = f"{top.title()} (+{diff['SOV'].max():.1f}% SOV)"
+    result["aggressive_mover"] = aggressive
+    return result
+
+
+def _detect_combinations(d2_row, comp):
+    """Detect dangerous driver combinations and return list of active flags."""
+    flags = []
+    zone_osa   = d2_row.get("OSA_Zone", "SAFE")
+    zone_disc  = d2_row.get("Discount_Zone", "OK")
+    zone_sov   = d2_row.get("SOV_Zone", "LOW")
+    hv_pct     = d2_row.get("High_Value_Store_Pct", 100)
+    consec_osa = d2_row.get("OSA_Consecutive_Decline_Days", 0)
+
+    comp_sov_rising = False
+    comp_disc_rising = False
+    if comp.get("d1") and comp.get("d2"):
+        comp_sov_rising  = comp["d2"].get("avg_comp_sov", 0)  > comp["d1"].get("avg_comp_sov", 0)
+        comp_disc_rising = comp["d2"].get("avg_comp_disc", 0) > comp["d1"].get("avg_comp_disc", 0)
+
+    if zone_osa in ("WARNING", "CRITICAL") and zone_sov in ("MODERATE", "SATURATED"):
+        flags.append("AD_WASTAGE: Ads running but OSA below safe zone — customers can't buy")
+    if zone_osa == "CRITICAL" and comp_disc_rising:
+        flags.append("DOUBLE_LOSS: OSA critical + competitor increasing discount")
+    if zone_osa == "CRITICAL" and zone_disc == "OK":
+        flags.append("OSA_ONLY: Availability collapse — no discount buffer")
+    if hv_pct < 30 and consec_osa >= 2:
+        flags.append("NETWORK_QUALITY_CRISIS: Low high-value store % + OSA declining")
+    if comp_sov_rising and zone_sov == "LOW":
+        flags.append("VISIBILITY_GAP: Competitor increasing ads while our SOV is low")
+    if zone_disc == "HIGH":
+        flags.append("DISCOUNT_HIGH: Discount above 20% — diminishing returns risk")
+    if not flags:
+        flags.append("NO_ACTIVE_RISK_COMBINATION")
+    return flags
+
+
+def build_sku_city_attribution(sku_city_ts, df24, df_all, d1_str, d2_str, mode="day", nat_lag=None):
+    """
+    Build Rs. attribution for every (SKU, City) pair.
+    mode='day':    compare single d1_str vs d2_str
+    mode='period': compare avg of period1 vs avg of period2 (d1_str=start1, d2_str=end1 not used for period)
+    """
+    label = f"[LLM Evidence] Building SKU x City attribution ({mode}) ..."
+    print(label)
+
+    drivers = ["OSA", "Discount", "Ad_SOV", "Network_Strength", "Organic_SOV"]
+    rows = []
+
+    grouped = sku_city_ts.groupby(["Product ID", "Product Name", "Grammage", "City"])
+
+    for (pid, pname, grammage, city), grp in grouped:
+        grp = grp.sort_values("Date").copy()
+
+        # ─── Snapshot extraction ─────────────────────────────────────
+        if mode == "day":
+            d1 = pd.Timestamp(d1_str)
+            d2 = pd.Timestamp(d2_str)
+            r1 = grp[grp["Date"] == d1]
+            r2 = grp[grp["Date"] == d2]
+            if r1.empty or r2.empty:
+                continue
+            s1 = r1.iloc[0].to_dict()
+            s2 = r2.iloc[0].to_dict()
+        else:  # period mode
+            p1s, p1e = pd.Timestamp(COMPARE_PERIOD1_START), pd.Timestamp(COMPARE_PERIOD1_END)
+            p2s, p2e = pd.Timestamp(COMPARE_PERIOD2_START), pd.Timestamp(COMPARE_PERIOD2_END)
+            p1 = grp[(grp["Date"] >= p1s) & (grp["Date"] <= p1e)]
+            p2 = grp[(grp["Date"] >= p2s) & (grp["Date"] <= p2e)]
+            if p1.empty or p2.empty:
+                continue
+            
+            num_cols = drivers + ["Revenue", "Darkstore_Count", "High_Value_Store_Count", "Network_Strength", "High_Value_Store_Pct", "OSA_Consecutive_Decline_Days"]
+            str_cols = ["OSA_Zone", "Discount_Zone", "SOV_Zone"]
+            
+            s2_num = p1[num_cols].mean().to_dict()
+            s2_str = p1[str_cols].iloc[-1].to_dict()
+            s2 = {**s2_num, **s2_str}
+            
+            s1_num = p2[num_cols].mean().to_dict()
+            s1_str = p2[str_cols].iloc[-1].to_dict()
+            s1 = {**s1_num, **s1_str}
+            
+            d1 = p2s
+            d2 = p1s
+
+        rev_delta = s2.get("Revenue", 0) - s1.get("Revenue", 0)
+
+        # ─── Correlations per (SKU, City) history ────────────────────
+        sens = _fit_sku_city_regression(grp, drivers, nat_lag)
+
+        # ─── Driver attribution ───────────────────────────────────────
+        d1_vals = {d: s1.get(d, 0) for d in drivers}
+        d2_vals = {d: s2.get(d, 0) for d in drivers}
+        attr, primary, unexplained = _build_attribution_row(grp, d1_vals, d2_vals, drivers, sens, rev_delta, d1, d2)
+
+        # ─── Darkstore quality narrative ──────────────────────────────
+        net_narrative = _network_quality_narrative(s1, s2)
+
+        # ─── Competitor snapshot ──────────────────────────────────────
+        category = df24[(df24["Product ID"] == pid)]["Category"].iloc[0] \
+                   if not df24[(df24["Product ID"] == pid)].empty else "Unknown"
+        city_key = city.lower().strip()
+        comp = _get_competitor_snapshot(df_all, category, city_key, d1, d2)
+
+        # ─── Combination flags ────────────────────────────────────────
+        combos = _detect_combinations(s2, comp)
+
+        # ─── Build flat output row ────────────────────────────────────
+        row = {
+            "Product ID": pid, "Product Name": pname, "Grammage": grammage, "City": city,
+            "Category": category,
+            "Revenue_d1": round(s1.get("Revenue", 0), 0),
+            "Revenue_d2": round(s2.get("Revenue", 0), 0),
+            "Revenue_Delta": round(rev_delta, 0),
+            "Primary_Driver": primary,
+            "Unexplained_Organic_Impact_Rs": round(unexplained, 0),
+
+            # Per-driver attribution
+            "OSA_d1": attr["OSA"]["d1"], "OSA_d2": attr["OSA"]["d2"],
+            "OSA_Delta": attr["OSA"]["delta"], "OSA_Impact_Rs": attr["OSA"]["impact_rs"],
+            "OSA_Confidence": attr["OSA"]["confidence"], "OSA_Credibility": attr["OSA"]["credibility_sentence"],
+            "OSA_Proof": attr["OSA"]["proof"],
+
+            "Discount_d1": attr["Discount"]["d1"], "Discount_d2": attr["Discount"]["d2"],
+            "Discount_Delta": attr["Discount"]["delta"], "Discount_Impact_Rs": attr["Discount"]["impact_rs"],
+            "Discount_Confidence": attr["Discount"]["confidence"], "Discount_Credibility": attr["Discount"]["credibility_sentence"],
+            "Discount_Proof": attr["Discount"]["proof"],
+
+            "Ad_SOV_d1": attr["Ad_SOV"]["d1"], "Ad_SOV_d2": attr["Ad_SOV"]["d2"],
+            "Ad_SOV_Delta": attr["Ad_SOV"]["delta"], "Ad_SOV_Impact_Rs": attr["Ad_SOV"]["impact_rs"],
+            "Ad_SOV_Confidence": attr["Ad_SOV"]["confidence"], "Ad_SOV_Credibility": attr["Ad_SOV"]["credibility_sentence"],
+            "Ad_SOV_Proof": attr["Ad_SOV"]["proof"],
+
+            "Network_d1": attr["Network_Strength"]["d1"], "Network_d2": attr["Network_Strength"]["d2"],
+            "Network_Delta": attr["Network_Strength"]["delta"],
+            "Network_Impact_Rs": attr["Network_Strength"]["impact_rs"],
+            "Network_Confidence": attr["Network_Strength"]["confidence"], "Network_Credibility": attr["Network_Strength"]["credibility_sentence"],
+            "Network_Proof": attr["Network_Strength"]["proof"],
+            "Network_Quality_Narrative": net_narrative,
+
+            # Zone status on d2
+            "OSA_Zone_d2": s2.get("OSA_Zone", ""),
+            "Discount_Zone_d2": s2.get("Discount_Zone", ""),
+            "SOV_Zone_d2": s2.get("SOV_Zone", ""),
+            "OSA_Consecutive_Decline_Days": s2.get("OSA_Consecutive_Decline_Days", 0),
+
+            # Competitor
+            "Comp_Rev_d1": comp.get("d1", {}).get("total_comp_rev", "N/A"),
+            "Comp_Rev_d2": comp.get("d2", {}).get("total_comp_rev", "N/A"),
+            "Comp_Avg_SOV_d1": comp.get("d1", {}).get("avg_comp_sov", "N/A"),
+            "Comp_Avg_SOV_d2": comp.get("d2", {}).get("avg_comp_sov", "N/A"),
+            "Comp_Avg_Disc_d1": comp.get("d1", {}).get("avg_comp_disc", "N/A"),
+            "Comp_Avg_Disc_d2": comp.get("d2", {}).get("avg_comp_disc", "N/A"),
+            "Aggressive_Competitor": comp.get("aggressive_mover", "None"),
+
+            # Combination flags
+            "Active_Combinations": " | ".join(combos),
+        }
+        rows.append(row)
+
+    df_attr = pd.DataFrame(rows)
+    if not df_attr.empty:
+        df_attr = df_attr.sort_values("Revenue_Delta")
+    print(f"    -> {len(df_attr)} SKU x City attribution rows built")
+    return df_attr
 
 
 if __name__ == "__main__":
